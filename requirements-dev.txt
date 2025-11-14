@@ -1,2 +1,23 @@
-pytest
-pytest-asyncio 
+# Testing dependencies
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+pytest-xdist>=3.5.0  # For parallel test execution
+pytest-timeout>=2.2.0  # For test timeouts
+
+# Code quality
+black>=23.12.1
+isort>=5.13.2
+mypy>=1.7.1
+flake8>=6.1.0
+bandit>=1.7.5  # Security linting
+pylint>=3.0.3
+
+# Type stubs
+types-PyYAML>=6.0.12
+types-requests>=2.31.0
+
+# Optional dependencies for new features
+pyyaml>=6.0.1  # For YAML config support
+tomli>=2.0.1; python_version < '3.11'  # For TOML config support 
