@@ -1,0 +1,98 @@
+# Development Docker Compose Override
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+version: '3.8'
+
+services:
+  postgres:
+    ports:
+      # Expose PostgreSQL to host for development tools
+      - "5432:5432"
+    environment:
+      # Less strict settings for development
+      POSTGRES_PASSWORD: devpassword
+
+  redis:
+    ports:
+      # Expose Redis to host for development tools
+      - "6379:6379"
+    environment:
+      # Less strict settings for development
+      REDIS_PASSWORD: devpassword
+    command: >
+      redis-server
+      --requirepass devpassword
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+
+  trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder  # Use builder stage for dev dependencies
+    # Override command for development
+    command: ["python", "beast_mode_bot.py", "--log-level", "DEBUG"]
+    environment:
+      # Development environment variables
+      DATABASE_URL: postgresql://kalshi:devpassword@postgres:5432/kalshi_trading
+      POSTGRES_PASSWORD: devpassword
+      REDIS_PASSWORD: devpassword
+      LIVE_TRADING_ENABLED: "false"  # Always paper trading in dev
+      LOG_LEVEL: DEBUG
+    volumes:
+      # Mount source code for hot reload (development only!)
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./logs:/app/logs
+      - ./data:/app/data
+    # No resource limits in development
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+
+  dashboard:
+    environment:
+      DATABASE_URL: postgresql://kalshi:devpassword@postgres:5432/kalshi_trading
+      POSTGRES_PASSWORD: devpassword
+      REDIS_PASSWORD: devpassword
+    volumes:
+      # Mount source code for hot reload
+      - ./src:/app/src
+      - ./trading_dashboard.py:/app/trading_dashboard.py
+      - ./logs:/app/logs:ro
+    ports:
+      - "8501:8501"
+
+  # Development tools
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: kalshi-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@kalshi.local
+      PGADMIN_DEFAULT_PASSWORD: devpassword
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - trading-network
+
+  # Redis Commander for Redis management
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: kalshi-redis-commander
+    restart: unless-stopped
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:devpassword
+    ports:
+      - "8081:8081"
+    networks:
+      - trading-network
+
+volumes:
+  pgadmin_data:
+    driver: local

@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+.tox/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Documentation
+*.md
+!README.md
+docs/
+IMPROVEMENT_PLAN.md
+IMPROVEMENTS_SUMMARY.md
+PHASE_1_COMPLETE.md
+
+# Database files (should use volumes)
+*.db
+*.sqlite
+*.sqlite3
+trading_system.db
+
+# Logs (should use volumes)
+logs/
+*.log
+
+# Environment files (use secrets management)
+.env
+.env.*
+!.env.template
+
+# Cache directories
+.cache/
+*.cache
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# API keys and secrets
+kalshi_private_key
+*.pem
+*.key
+*.crt
+
+# Data files (should use volumes)
+data/
+backups/
+
+# Development files
+requirements-dev.txt
+tests/
+pytest.ini
+.coveragerc
+mypy.ini
+.pylintrc
+
+# Docker files (don't need inside container)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
