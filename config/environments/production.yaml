@@ -1,0 +1,128 @@
+# Production Configuration for Kalshi AI Trading Bot
+# This file demonstrates YAML-based configuration
+# Environment variables still take precedence for secrets
+
+api:
+  kalshi_base_url: "https://api.elections.kalshi.com"
+  openai_base_url: "https://api.openai.com/v1"
+
+trading:
+  position_sizing:
+    max_position_size_pct: 3.0  # More conservative in production
+    max_daily_loss_pct: 10.0     # Tighter risk controls
+    max_positions: 10             # Fewer concurrent positions
+    min_balance: 100.0           # Higher minimum balance
+    use_kelly_criterion: true
+    kelly_fraction: 0.5          # Half Kelly for safety
+    max_single_position: 0.03
+
+  market_filtering:
+    min_volume: 500.0            # Higher volume requirement
+    max_time_to_expiry_days: 14  # Shorter timeframes
+    min_volume_for_ai_analysis: 500.0
+    min_volume_for_market_making: 1000.0
+    min_price_movement: 0.05
+    max_bid_ask_spread: 0.10
+    excluded_categories: []
+
+  ai_model:
+    primary_model: "grok-4"
+    fallback_model: "grok-3"
+    ai_temperature: 0.0
+    ai_max_tokens: 8000
+    min_confidence_to_trade: 0.65  # Higher confidence required
+    min_confidence_threshold: 0.60
+    min_confidence_for_large_size: 0.75
+    high_confidence_threshold: 0.95
+    high_confidence_market_odds: 0.90
+
+  cost_control:
+    daily_ai_budget: 25.0        # Conservative budget
+    daily_ai_cost_limit: 25.0
+    enable_daily_cost_limiting: true
+    sleep_when_limit_reached: true
+    max_analysis_cost_per_decision: 0.10
+    max_ai_cost_per_decision: 0.08
+    analysis_cooldown_hours: 6   # Longer cooldown
+    max_analyses_per_market_per_day: 2
+    skip_news_for_low_volume: true
+    news_search_volume_threshold: 1000.0
+
+  trading_frequency:
+    market_scan_interval: 60     # Less frequent scanning
+    position_check_interval: 30
+    max_trades_per_hour: 10      # Rate limiting
+    run_interval_minutes: 15
+    scan_interval_seconds: 60
+    num_processor_workers: 3
+
+  strategy_allocation:
+    market_making_allocation: 0.30
+    directional_allocation: 0.60
+    arbitrage_allocation: 0.10
+    enable_market_making: true
+    enable_high_confidence_strategy: true
+
+  portfolio_optimization:
+    use_risk_parity: true
+    rebalance_hours: 12
+    min_position_size: 10.0
+    max_opportunities_per_batch: 30
+    max_volatility: 0.50          # Stricter risk limits
+    max_correlation: 0.70
+    max_drawdown: 0.25
+    max_sector_exposure: 0.60
+
+  performance_targets:
+    target_sharpe: 0.5
+    target_return: 0.12
+    min_trade_edge: 0.15
+
+  dynamic_exit:
+    use_dynamic_exits: true
+    profit_threshold: 0.25
+    loss_threshold: 0.10
+    confidence_decay_threshold: 0.20
+    max_hold_time_hours: 168
+    volatility_adjustment: true
+    high_confidence_expiry_hours: 24
+
+  market_making:
+    min_spread_for_making: 0.02
+    max_inventory_risk: 0.10
+    order_refresh_minutes: 15
+    max_orders_per_market: 4
+
+  system_behavior:
+    beast_mode_enabled: true
+    fallback_to_legacy: true
+    live_trading_enabled: true    # PRODUCTION MODE
+    paper_trading_mode: false     # REAL MONEY
+    performance_monitoring: true
+    cross_market_arbitrage: false
+    multi_model_ensemble: false
+    sentiment_analysis: false
+    options_strategies: false
+    algorithmic_execution: false
+
+logging:
+  log_level: "INFO"
+  log_file: "logs/trading_system_prod.log"
+  enable_file_logging: true
+  enable_console_logging: true
+  max_log_file_size: 52428800  # 50MB
+  backup_count: 10
+
+database:
+  database_type: "postgresql"  # PostgreSQL for production
+  pool_size: 20
+  max_overflow: 40
+  pool_timeout: 30
+  pool_recycle: 3600
+
+cache:
+  enable_caching: true
+  cache_type: "redis"  # Redis for production
+  market_data_ttl: 30
+  balance_ttl: 60
+  position_ttl: 30

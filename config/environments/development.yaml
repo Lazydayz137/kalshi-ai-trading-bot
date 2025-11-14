@@ -1,0 +1,42 @@
+# Development Configuration for Kalshi AI Trading Bot
+# Optimized for testing and development
+
+api:
+  kalshi_base_url: "https://api.elections.kalshi.com"
+
+trading:
+  position_sizing:
+    max_position_size_pct: 5.0
+    max_daily_loss_pct: 15.0
+    max_positions: 15
+    min_balance: 50.0
+    kelly_fraction: 0.75
+
+  market_filtering:
+    min_volume: 200.0
+    max_time_to_expiry_days: 30
+
+  ai_model:
+    primary_model: "grok-4"
+    min_confidence_to_trade: 0.50
+
+  cost_control:
+    daily_ai_budget: 50.0
+    analysis_cooldown_hours: 2
+    max_analyses_per_market_per_day: 6
+
+  system_behavior:
+    live_trading_enabled: false  # PAPER TRADING
+    paper_trading_mode: true     # SAFE MODE
+
+logging:
+  log_level: "DEBUG"
+  log_file: "logs/trading_system_dev.log"
+
+database:
+  database_type: "sqlite"
+  sqlite_path: "trading_system_dev.db"
+
+cache:
+  enable_caching: true
+  cache_type: "memory"  # In-memory cache for dev
