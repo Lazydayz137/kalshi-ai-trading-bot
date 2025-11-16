@@ -1,0 +1,199 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    name: Build and Test Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata (tags, labels)
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        load: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Test Docker image
+      run: |
+        # Get the first tag from the metadata
+        IMAGE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
+
+        # Create a minimal .env file for testing
+        cat > .env.test << EOF
+        KALSHI_API_KEY=test_key
+        XAI_API_KEY=test_key
+        OPENAI_API_KEY=test_key
+        DATABASE_TYPE=sqlite
+        SQLITE_PATH=/tmp/test.db
+        CACHE_TYPE=memory
+        LIVE_TRADING_ENABLED=false
+        LOG_LEVEL=INFO
+        EOF
+
+        # Run container with health check
+        docker run --rm \
+          --env-file .env.test \
+          --health-cmd="python -c 'from src.utils.health_check import perform_health_check; import asyncio; exit(0 if asyncio.run(perform_health_check()).healthy else 1)'" \
+          --health-interval=5s \
+          --health-timeout=3s \
+          --health-retries=3 \
+          ${IMAGE_TAG} python -c "print('Docker image test passed!')"
+
+    - name: Push Docker image
+      if: github.event_name != 'pull_request'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Generate image summary
+      if: github.event_name != 'pull_request'
+      run: |
+        echo "# Docker Image Published" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Image Tags" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Pull Command" >> $GITHUB_STEP_SUMMARY
+        echo '```bash' >> $GITHUB_STEP_SUMMARY
+        echo "docker pull $(echo '${{ steps.meta.outputs.tags }}' | head -n 1)" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+  docker-compose-test:
+    name: Test Docker Compose Stack
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create test environment file
+      run: |
+        cp .env.docker.template .env
+        # Set test values
+        sed -i 's/your_kalshi_api_key_here/test_kalshi_key/' .env
+        sed -i 's/your_xai_api_key_here/test_xai_key/' .env
+        sed -i 's/your_openai_api_key_here/test_openai_key/' .env
+
+    - name: Start Docker Compose stack
+      run: |
+        docker compose up -d
+
+        # Wait for services to be healthy
+        echo "Waiting for services to be healthy..."
+        timeout 120 bash -c 'until docker compose ps | grep -q "healthy"; do sleep 2; done'
+
+    - name: Check service health
+      run: |
+        docker compose ps
+        docker compose logs trading-bot
+
+    - name: Run integration tests
+      run: |
+        # Run health check inside the container
+        docker compose exec -T trading-bot python -c "
+        from src.utils.health_check import perform_health_check
+        import asyncio
+        result = asyncio.run(perform_health_check())
+        print(f'Health check result: {result.healthy}')
+        exit(0 if result.healthy else 1)
+        "
+
+    - name: Stop Docker Compose stack
+      if: always()
+      run: docker compose down -v
+
+  vulnerability-scan:
+    name: Scan Docker Image for Vulnerabilities
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build image for scanning
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        load: true
+        tags: vulnerability-scan:latest
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: vulnerability-scan:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Run Trivy vulnerability scanner (table output)
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: vulnerability-scan:latest
+        format: 'table'
+        exit-code: '0'
+        severity: 'CRITICAL,HIGH'

@@ -1,0 +1,55 @@
+# ==========================================
+# Bandit Security Scanner Configuration
+# ==========================================
+
+[bandit]
+# Directories to exclude from scanning
+exclude_dirs = [
+    '/tests',
+    '/venv',
+    '/.venv',
+    '/build',
+    '/dist',
+    '/.git',
+    '/.mypy_cache',
+    '/.pytest_cache',
+    '/__pycache__'
+]
+
+# Tests to skip
+# B101: assert_used - asserts are OK in our codebase
+# B601: paramiko_calls - not using paramiko
+# B602: subprocess_popen_with_shell_equals_true - we validate shell commands
+skips = ['B101', 'B601']
+
+# Test IDs to run (leave empty to run all)
+tests = []
+
+# Severity level threshold (LOW, MEDIUM, HIGH)
+# Only report issues with this severity or higher
+level = 'LOW'
+
+# Confidence level threshold (LOW, MEDIUM, HIGH)
+# Only report issues with this confidence or higher
+confidence = 'LOW'
+
+# Output format
+# Options: csv, custom, html, json, screen, txt, xml, yaml
+format = 'screen'
+
+# Maximum number of lines to report per finding
+max_lines = 5
+
+# Aggregate output by filename
+aggregate = 'file'
+
+# Show progress
+verbose = false
+
+# Plugins to load
+# Leave empty to load all plugins
+plugins = []
+
+# Baseline file to compare against
+# This allows you to ignore previously identified issues
+# baseline = 'baseline.json'
