@@ -4,7 +4,7 @@
 version: '3.8'
 
 services:
-  # PostgreSQL Database
+  # PostgreSQL Database (for trading operations)
   postgres:
     image: postgres:16-alpine
     container_name: kalshi-postgres
@@ -26,6 +26,37 @@ services:
       retries: 5
     networks:
       - trading-network
+
+  # TimescaleDB (for time series data - real-time ticks, features, etc.)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: kalshi-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${TIMESCALE_DATABASE:-kalshi_timeseries}
+      POSTGRES_USER: ${TIMESCALE_USER:-kalshi_ts}
+      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD:-changeme}
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./scripts/timescale_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "${TIMESCALE_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TIMESCALE_USER:-kalshi_ts} -d ${TIMESCALE_DATABASE:-kalshi_timeseries}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - trading-network
+    # Resource limits for time series workload
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
 
   # Redis Cache
   redis:
@@ -160,6 +191,8 @@ networks:
 
 volumes:
   postgres_data:
+    driver: local
+  timescale_data:
     driver: local
   redis_data:
     driver: local
