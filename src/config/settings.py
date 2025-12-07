@@ -26,19 +26,19 @@ class APIConfig:
 @dataclass
 class TradingConfig:
     """Trading strategy configuration."""
-    # Position sizing and risk management - MADE MORE AGGRESSIVE  
-    max_position_size_pct: float = 5.0  # INCREASED: Back to 5% per position (was 3%)
-    max_daily_loss_pct: float = 15.0    # INCREASED: Allow 15% daily loss (was 10%) 
-    max_positions: int = 15              # INCREASED: Allow 15 concurrent positions (was 10)
-    min_balance: float = 50.0           # REDUCED: Lower minimum to trade more (was 100)
+    # Position sizing and risk management - CONSERVATIVE SETTINGS FOR SAFETY
+    max_position_size_pct: float = 3.0  # CONSERVATIVE: 3% max per position for risk control
+    max_daily_loss_pct: float = 10.0    # CONSERVATIVE: 10% daily loss limit
+    max_positions: int = 10              # CONSERVATIVE: Max 10 concurrent positions
+    min_balance: float = 100.0          # CONSERVATIVE: Minimum $100 balance required
     
-    # Market filtering criteria - MUCH MORE PERMISSIVE
-    min_volume: float = 200.0            # DECREASED: Much lower volume requirement (was 500, now 200)
-    max_time_to_expiry_days: int = 30    # INCREASED: Allow longer timeframes (was 14, now 30)
-    
-    # AI decision making - MORE AGGRESSIVE THRESHOLDS
-    min_confidence_to_trade: float = 0.50   # DECREASED: Lower confidence barrier (was 0.65, now 0.50)
-    scan_interval_seconds: int = 30      # DECREASED: Scan more frequently (was 60, now 30)
+    # Market filtering criteria - CONSERVATIVE FOR QUALITY
+    min_volume: float = 500.0            # CONSERVATIVE: Higher volume for better liquidity
+    max_time_to_expiry_days: int = 30    # Reasonable timeframe for predictions
+
+    # AI decision making - CONSERVATIVE CONFIDENCE THRESHOLDS
+    min_confidence_to_trade: float = 0.65   # CONSERVATIVE: 65% minimum confidence required
+    scan_interval_seconds: int = 60      # CONSERVATIVE: Scan every 60 seconds to reduce API load
     
     # AI model configuration
     primary_model: str = "grok-4" # DO NOT CHANGE THIS UNDER ANY CIRCUMSTANCES
@@ -50,16 +50,16 @@ class TradingConfig:
     default_position_size: float = 3.0  # REDUCED: Now using Kelly Criterion as primary method (was 5%, now 3%)
     position_size_multiplier: float = 1.0  # Multiplier for AI confidence
     
-    # Kelly Criterion settings (PRIMARY position sizing method) - MORE AGGRESSIVE
+    # Kelly Criterion settings (PRIMARY position sizing method) - CONSERVATIVE
     use_kelly_criterion: bool = True        # Use Kelly Criterion for position sizing (PRIMARY METHOD)
-    kelly_fraction: float = 0.75            # INCREASED: More aggressive Kelly multiplier (was 0.5, now 0.75)
-    max_single_position: float = 0.05       # INCREASED: Higher position cap (was 0.03, now 5%)
+    kelly_fraction: float = 0.25            # CONSERVATIVE: Quarter Kelly for safety (industry standard)
+    max_single_position: float = 0.03       # CONSERVATIVE: 3% max single position cap
     
-    # Trading frequency - MORE FREQUENT
-    market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)
-    position_check_interval: int = 15       # DECREASED: Check positions every 15 seconds (was 30)
-    max_trades_per_hour: int = 20           # INCREASED: Allow more trades per hour (was 10, now 20)
-    run_interval_minutes: int = 10          # DECREASED: Run more frequently (was 15, now 10)
+    # Trading frequency - CONSERVATIVE TO REDUCE COSTS
+    market_scan_interval: int = 60          # CONSERVATIVE: Scan every 60 seconds
+    position_check_interval: int = 30       # CONSERVATIVE: Check positions every 30 seconds
+    max_trades_per_hour: int = 10           # CONSERVATIVE: Limit to 10 trades per hour
+    run_interval_minutes: int = 15          # CONSERVATIVE: Run every 15 minutes
     num_processor_workers: int = 5      # Number of concurrent market processor workers
     
     # Market selection preferences
@@ -72,25 +72,33 @@ class TradingConfig:
     high_confidence_market_odds: float = 0.90 # Market price to look for
     high_confidence_expiry_hours: int = 24   # Max hours until expiry
 
-    # AI trading criteria - MORE PERMISSIVE
-    max_analysis_cost_per_decision: float = 0.15  # INCREASED: Allow higher cost per decision (was 0.10, now 0.15)
-    min_confidence_threshold: float = 0.45  # DECREASED: Lower confidence threshold (was 0.55, now 0.45)
+    # AI trading criteria - CONSERVATIVE COST CONTROLS
+    max_analysis_cost_per_decision: float = 0.10  # CONSERVATIVE: $0.10 max per decision
+    min_confidence_threshold: float = 0.60  # CONSERVATIVE: 60% minimum confidence
 
-    # Cost control and market analysis frequency - MORE PERMISSIVE
-    daily_ai_budget: float = 10.0  # INCREASED: Higher daily budget (was 5.0, now 10.0)
-    max_ai_cost_per_decision: float = 0.08  # INCREASED: Higher per-decision cost (was 0.05, now 0.08)
-    analysis_cooldown_hours: int = 3  # DECREASED: Shorter cooldown (was 6, now 3)
-    max_analyses_per_market_per_day: int = 4  # INCREASED: More analyses per day (was 2, now 4)
+    # Cost control and market analysis frequency - CONSERVATIVE BUDGET
+    daily_ai_budget: float = 5.0  # CONSERVATIVE: $5 daily AI budget
+    max_ai_cost_per_decision: float = 0.05  # CONSERVATIVE: $0.05 max per decision
+    analysis_cooldown_hours: int = 6  # CONSERVATIVE: 6 hour cooldown between analyses
+    max_analyses_per_market_per_day: int = 2  # CONSERVATIVE: Max 2 analyses per market per day
     
     # Daily AI spending limits - SAFETY CONTROLS
     daily_ai_cost_limit: float = 50.0  # Maximum daily spending on AI API calls (USD)
     enable_daily_cost_limiting: bool = True  # Enable daily cost limits
     sleep_when_limit_reached: bool = True  # Sleep until next day when limit reached
 
-    # Enhanced market filtering to reduce analyses - MORE PERMISSIVE
-    min_volume_for_ai_analysis: float = 200.0  # DECREASED: Much lower threshold (was 500, now 200)
+    # Paper Trading Configuration
+    paper_trading_mode: bool = True  # SAFE DEFAULT: Paper trading enabled
+    paper_trading_balance: float = 10000.0  # Starting balance for paper trading
+    paper_simulate_slippage: bool = True  # Simulate realistic slippage
+    paper_simulate_fees: bool = True  # Simulate Kalshi fees (0.7%)
+    paper_slippage_bps: float = 5.0  # Slippage in basis points (0.05%)
+
+    # Enhanced market filtering to reduce analyses - CONSERVATIVE FILTERS
+    min_volume_for_ai_analysis: float = 500.0  # CONSERVATIVE: $500 minimum volume for AI analysis
     exclude_low_liquidity_categories: List[str] = field(default_factory=lambda: [
-        # REMOVED weather and entertainment - trade all categories
+        "weather",  # Exclude low-liquidity weather markets
+        "entertainment"  # Exclude entertainment markets
     ])
 
 
@@ -131,19 +139,19 @@ max_drawdown: float = 0.50              # High drawdown tolerance (50%)
 max_sector_exposure: float = 0.90       # Very high sector concentration (90%)
 
 # === PERFORMANCE TARGETS ===
-# System performance objectives - MORE AGGRESSIVE FOR MORE TRADES
-target_sharpe: float = 0.3              # DECREASED: Lower Sharpe requirement (was 0.5, now 0.3)
-target_return: float = 0.15             # INCREASED: Higher return target (was 0.10, now 0.15)
-min_trade_edge: float = 0.08           # DECREASED: Lower edge requirement (was 0.15, now 8%)
-min_confidence_for_large_size: float = 0.50  # DECREASED: Lower confidence requirement (was 0.65, now 50%)
+# System performance objectives - CONSERVATIVE FOR QUALITY TRADES
+target_sharpe: float = 1.5              # CONSERVATIVE: Target 1.5 Sharpe ratio
+target_return: float = 0.20             # Reasonable 20% annual return target
+min_trade_edge: float = 0.10            # CONSERVATIVE: 10% minimum edge required
+min_confidence_for_large_size: float = 0.70  # CONSERVATIVE: 70% confidence for large positions
 
 # === DYNAMIC EXIT STRATEGIES ===
-# Enhanced exit strategy settings - MORE AGGRESSIVE
+# Enhanced exit strategy settings - CONSERVATIVE RISK MANAGEMENT
 use_dynamic_exits: bool = True
-profit_threshold: float = 0.20          # DECREASED: Take profits sooner (was 0.25, now 0.20)
-loss_threshold: float = 0.15            # INCREASED: Allow larger losses (was 0.10, now 0.15)
-confidence_decay_threshold: float = 0.25  # INCREASED: Allow more confidence decay (was 0.20, now 0.25)
-max_hold_time_hours: int = 240          # INCREASED: Hold longer (was 168, now 240 hours = 10 days)
+profit_threshold: float = 0.25          # CONSERVATIVE: Take 25% profits
+loss_threshold: float = 0.10            # CONSERVATIVE: Cut losses at 10%
+confidence_decay_threshold: float = 0.20  # CONSERVATIVE: Exit if confidence drops 20%
+max_hold_time_hours: int = 168          # CONSERVATIVE: Max 7 days hold time
 volatility_adjustment: bool = True      # Adjust exits based on volatility
 
 # === MARKET MAKING STRATEGY ===
@@ -163,12 +171,12 @@ min_price_movement: float = 0.02        # DECREASED: Lower minimum range (was 0.
 max_bid_ask_spread: float = 0.15        # INCREASED: Allow wider spreads (was 0.10, now 15¢)
 min_confidence_long_term: float = 0.45  # DECREASED: Lower confidence for distant expiries (was 0.65, now 45%)
 
-# === COST OPTIMIZATION (MORE GENEROUS) ===
+# === COST OPTIMIZATION (CONSERVATIVE BUDGET) ===
 # Enhanced cost controls for the beast mode system
-daily_ai_budget: float = 15.0           # INCREASED: Higher budget for more opportunities (was 10.0, now 15.0)
-max_ai_cost_per_decision: float = 0.12  # INCREASED: Higher per-decision limit (was 0.08, now 0.12)
-analysis_cooldown_hours: int = 2        # DECREASED: Much shorter cooldown (was 4, now 2)
-max_analyses_per_market_per_day: int = 6  # INCREASED: More analyses per day (was 3, now 6)
+daily_ai_budget: float = 5.0            # CONSERVATIVE: $5 daily AI budget
+max_ai_cost_per_decision: float = 0.08  # CONSERVATIVE: $0.08 max per decision
+analysis_cooldown_hours: int = 6        # CONSERVATIVE: 6 hour cooldown
+max_analyses_per_market_per_day: int = 2  # CONSERVATIVE: Max 2 analyses per market per day
 skip_news_for_low_volume: bool = True   # Skip expensive searches for low volume
 news_search_volume_threshold: float = 1000.0  # News threshold
 
