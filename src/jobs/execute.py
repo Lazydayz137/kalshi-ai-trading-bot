@@ -37,13 +37,22 @@ async def execute_position(
     if live_mode:
         try:
             client_order_id = str(uuid.uuid4())
+            # Determine price parameters based on side
+            # Even for market orders, suggesting a limit/cap is good practice or required
+            price_cents = int(position.entry_price * 100)
+            
+            yes_price = price_cents if position.side.lower() == 'yes' else None
+            no_price = price_cents if position.side.lower() == 'no' else None
+
             order_response = await kalshi_client.place_order(
                 ticker=position.market_id,
                 client_order_id=client_order_id,
                 side=position.side.lower(),
                 action="buy",
                 count=position.quantity,
-                type_="market"
+                type_="market",
+                yes_price=yes_price,
+                no_price=no_price
             )
             
             # For a market order, the fill price is not guaranteed.

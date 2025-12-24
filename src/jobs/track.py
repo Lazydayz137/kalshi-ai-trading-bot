@@ -67,12 +67,8 @@ async def should_exit_position(
     if position.take_profit_price:
         take_profit_triggered = False
         
-        if position.side == "YES":
-            # For YES positions, take profit when price rises above target
-            take_profit_triggered = current_price >= position.take_profit_price
-        else:
-            # For NO positions, take profit when price falls below target
-            take_profit_triggered = current_price <= position.take_profit_price
+        # All positions are LONG (want price to rise)
+        take_profit_triggered = current_price >= position.take_profit_price
             
         if take_profit_triggered:
             return True, "take_profit", current_price
@@ -226,12 +222,23 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         pnl=pnl,
                         entry_timestamp=position.timestamp,
                         exit_timestamp=datetime.now(),
-                        rationale=f"{position.rationale} | EXIT: {exit_reason}"
+                        rationale=f"{position.rationale} | EXIT: {exit_reason}",
+                        decision_id=position.decision_id,
+                        strategy=position.strategy
                     )
 
                     # Record the exit
                     await db_manager.add_trade_log(trade_log)
                     await db_manager.update_position_status(position.id, 'closed')
+                    
+                    # Close the Data Collection Loop (RL Feedback)
+                    if position.decision_id:
+                        try:
+                            outcome_score = 1 if pnl > 0 else -1 if pnl < 0 else 0
+                            await db_manager.update_training_outcome(position.decision_id, pnl, outcome_score)
+                            logger.info(f"💾 Updated training example {position.decision_id} with outcome: {outcome_score} (PnL: ${pnl:.2f})")
+                        except Exception as e:
+                            logger.error(f"Failed to update training outcome: {e}")
                     
                     exits_executed += 1
                     logger.info(

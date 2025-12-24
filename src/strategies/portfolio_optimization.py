@@ -34,6 +34,7 @@ warnings.filterwarnings('ignore')
 from src.utils.database import DatabaseManager, Market, Position
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
+from src.clients.odds_client import OddsClient
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 
@@ -62,6 +63,9 @@ class MarketOpportunity:
     sharpe_ratio: float
     sortino_ratio: float
     max_drawdown_contribution: float
+    
+    # Data collection
+    decision_id: Optional[int] = None
 
 
 @dataclass
@@ -99,11 +103,13 @@ class AdvancedPortfolioOptimizer:
         self,
         db_manager: DatabaseManager,
         kalshi_client: KalshiClient,
-        xai_client: XAIClient
+        xai_client: XAIClient,
+        odds_client: Optional[OddsClient] = None
     ):
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
         self.xai_client = xai_client
+        self.odds_client = odds_client
         self.logger = get_trading_logger("portfolio_optimizer")
         
         # Portfolio parameters
@@ -172,7 +178,7 @@ class AdvancedPortfolioOptimizer:
                 # Update the opportunity object in place
                 opp.kelly_fraction = kelly_val
                 opp.fractional_kelly = kelly_val * 0.5  # Conservative Kelly
-                opp.risk_adjusted_fraction = final_kelly
+                opp.risk_adjusted_fraction = kelly_val
             
             # Step 4: Apply correlation adjustments
             correlation_matrix = await self._estimate_correlation_matrix(enhanced_opportunities)
@@ -819,7 +825,9 @@ async def create_market_opportunities_from_markets(
     xai_client: XAIClient,
     kalshi_client: KalshiClient,
     db_manager: DatabaseManager = None,
-    total_capital: float = 10000
+    total_capital: float = 10000,
+    odds_client: Optional[OddsClient] = None,
+    arbitrage_engine: Optional[Any] = None
 ) -> List[MarketOpportunity]:
     """
     Convert Market objects to MarketOpportunity objects with all required metrics.
@@ -828,14 +836,30 @@ async def create_market_opportunities_from_markets(
     opportunities = []
     
     # Limit markets to prevent excessive AI costs and focus on best opportunities
-    max_markets_to_analyze = 10  # REDUCED: More selective (was 20, now 10) to focus on highest quality
+    # Limit markets to prevent excessive AI costs and focus on best opportunities
+    max_markets_to_analyze = 50  # INCREASED: Analyze top 50 markets (was 10) to find more opportunities
     if len(markets) > max_markets_to_analyze:
         # Sort by volume and take top markets
         markets = sorted(markets, key=lambda m: m.volume, reverse=True)[:max_markets_to_analyze]
         logger.info(f"Limited to top {max_markets_to_analyze} markets by volume for AI analysis")
     
+    # Pre-fetch sports dict if odds client available
+    active_sports = []
+    if odds_client:
+        try:
+            active_sports = await odds_client.get_active_sports()
+            logger.info(f"Fetched {len(active_sports)} active sports from Odds API")
+        except Exception as e:
+            logger.warning(f"Failed to fetch sports: {e}")
+
     for market in markets:
         try:
+            # 🛑 1. FAST FAIL: JUNK FILTER (User Request: "stupid questions")
+            # Must run inside loop
+            from src.strategies.filters import MarketFilter
+            if MarketFilter.is_junk_market(market):
+                continue
+
             # Get current market data
             market_data = await kalshi_client.get_market(market.market_id)
             if not market_data:
@@ -843,462 +867,156 @@ async def create_market_opportunities_from_markets(
             
             # FIXED: Extract from nested 'market' object (same fix as immediate trading)
             market_info = market_data.get('market', {})
-            market_prob = market_info.get('yes_price', 50) / 100
+            
+            # CHECK SPREAD (Critical Fix for "Instant Loss")
+            yes_bid = market_info.get('yes_bid', 0)
+            yes_ask = market_info.get('yes_ask', 0)
+            spread = yes_ask - yes_bid
+            
+            if spread > 15:  # Relaxed to 15 cent spread to allow more trades
+                logger.warning(f"Skipping {market.market_id}: Spread too wide ({spread}¢). Bid: {yes_bid}, Ask: {yes_ask}")
+                continue
+
+            # CHECK SPREAD PERCENTAGE (Prevent 3¢ loss on 15¢ contract = 20% loss)
+            # Use Ask price as denimator (Cost basis)
+            if yes_ask > 0:
+                spread_pct = spread / yes_ask
+                if spread_pct > 0.10: # Max 10% instant loss allowed
+                     logger.warning(f"Skipping {market.market_id}: Spread % too high ({spread_pct:.1%}). Bid: {yes_bid}, Ask: {yes_ask}")
+                     continue
+                
+            # Use Mid-Price for fairer probability estimation, or Last Price as fallback
+            if yes_ask > 0 and yes_bid > 0:
+                market_prob = ((yes_bid + yes_ask) / 2) / 100
+            else:
+                market_prob = market_info.get('yes_price', 50) / 100
             
             # Skip markets with extreme prices (too risky for portfolio)
             if market_prob < 0.05 or market_prob > 0.95:
                 continue
             
+            # Context from Odds API
+            odds_context = ""
+            if odds_client and active_sports:
+                # Dynamic mapping logic
+                matching_sports = []
+                
+                # normalize strings for matching
+                market_title_lower = market.title.lower()
+                market_cat_lower = market.category.lower()
+                
+                for sport in active_sports:
+                    sport_key = sport['key']
+                    sport_title = sport['title'].lower()
+                    sport_group = sport.get('group', '').lower()
+                    
+                    # Direct Match
+                    if sport_title in market_title_lower or sport_title in market_cat_lower:
+                        matching_sports.append(sport_key)
+                        continue
+                        
+                    # Group Match (e.g. "Basketball" matches "NBA")
+                    if sport_group and (sport_group in market_title_lower or sport_group in market_cat_lower):
+                        matching_sports.append(sport_key)
+                        continue
+                
+                # Fetch odds for all matching sports (usually just 1)
+                # Limit to 3 to avoid spamming API if generic match (e.g. "soccer")
+                for sport_key in list(set(matching_sports))[:3]:
+                    # Request H2H AND Outrights (Winner) to cover Golf/Futures
+                    odds = await odds_client.get_odds(sport_key, markets="h2h,outrights")
+                    
+                    # Fuzzy match event
+                    for event in odds:
+                        # Check if team names present in Kalshi title
+                        # For Golf/Outrights, home_team might be the Player Name?
+                        # In Outrights, 'home_team' is often the event name, and bookmakers have 'outcomes' with player names.
+                        
+                        is_match = False
+                        
+                        # 1. Event Name Match
+                        if event.home_team in market.title or event.home_team in market_title_lower:
+                            is_match = True
+                        elif event.away_team and (event.away_team in market.title):
+                            is_match = True
+                            
+                        # 2. Player Name Scan (Crucial for Golf/Tennis Outrights)
+                        # We need to peek into bookmakers to find player names if it's an outright market
+                        found_outcome_match = False
+                        for booky in event.bookmakers:
+                                    for outcome in mkt['outcomes']:
+                                        if outcome['name'] in market.title:
+                                            found_outcome_match = True
+                                            odds_context += f"DraftKings Odds ({event.sport_title}): {outcome['name']} {outcome['price']} (Implied: {1/outcome['price']:.2%}); "
+
             # Get REAL AI prediction using fast analysis
-            predicted_prob, confidence = await _get_fast_ai_prediction(
-                market, xai_client, market_prob
+            predicted_prob, confidence, decision_id = await _get_fast_ai_prediction(
+                market, xai_client, market_prob, odds_context, db_manager, arbitrage_engine
             )
-            
-            # If AI analysis failed, skip this market
-            if predicted_prob is None or confidence is None:
-                logger.warning(f"AI analysis failed for {market.market_id}, skipping")
-                continue
-            
-            # Calculate metrics
-            edge = predicted_prob - market_prob
-            expected_return = abs(edge) * confidence
-            volatility = np.sqrt(market_prob * (1 - market_prob))
-            max_loss = market_prob if edge > 0 else (1 - market_prob)
-            
-            # Time to expiry
-            time_to_expiry = 30.0  # Default 30 days
-            if hasattr(market, 'expiration_ts') and market.expiration_ts:
-                import time
-                time_to_expiry = (market.expiration_ts - time.time()) / 86400
-                time_to_expiry = max(0.1, time_to_expiry)
-            
-            # Apply Grok4 edge filtering - 10% minimum edge requirement
-            from src.utils.edge_filter import EdgeFilter
-            edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
-            
-            if edge_result.passes_filter:  # Must pass 10% edge filter
-                opportunity = MarketOpportunity(
-                    market_id=market.market_id,
-                    market_title=market.title,
-                    predicted_probability=predicted_prob,
-                    market_probability=market_prob,
-                    confidence=confidence,
-                    edge=edge,
-                    volatility=volatility,
-                    expected_return=expected_return,
-                    max_loss=max_loss,
-                    time_to_expiry=time_to_expiry,
-                    correlation_score=0.0,
-                    kelly_fraction=0.0,
-                    fractional_kelly=0.0,
-                    risk_adjusted_fraction=0.0,
-                    sharpe_ratio=0.0,
-                    sortino_ratio=0.0,
-                    max_drawdown_contribution=0.0
-                )
-                
-                # Add edge filter results to opportunity
-                opportunity.edge = edge_result.edge_magnitude  # Use filtered edge
-                opportunity.edge_percentage = edge_result.edge_percentage
-                opportunity.recommended_side = edge_result.side
-                
-                opportunities.append(opportunity)
-                logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")
-                
-                # 🚀 IMMEDIATE TRADING: Place trade for strong opportunities
-                if db_manager:
-                    await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
-            else:
-                logger.info(f"❌ EDGE FILTERED: {market.market_id} - {edge_result.reason}")
+
+            opportunity = MarketOpportunity(
+                market_id=market.market_id,
+                question=market.title,
+                answer="Yes",
+                current_price=market_prob,
+                consensus_probability=predicted_prob,
+                confidence=confidence,
+                volume=market.volume,
+                liquidity=market.volume * market_prob * 100,
+                category=market.category,
+                decision_id=decision_id
+            )
+            opportunities.append(opportunity)
             
         except Exception as e:
-            logger.error(f"Error creating opportunity from {market.market_id}: {e}")
+            logger.error(f"Error processing market {market.market_id}: {e}")
             continue
-    
-    logger.info(f"Created {len(opportunities)} opportunities from {len(markets)} markets")
+
     return opportunities
-
-async def _evaluate_immediate_trade(
-    opportunity: MarketOpportunity, 
-    db_manager: DatabaseManager, 
-    kalshi_client: KalshiClient, 
-    total_capital: float
-) -> None:
-    """
-    Evaluate if an opportunity should be traded immediately.
-    For strong opportunities, place trade right away instead of waiting for batch optimization.
-    """
-    logger = get_trading_logger("immediate_trading")  # Move logger definition to the top
-    
-    try:
-        # Use enhanced edge filtering for immediate trading decisions
-        from src.utils.edge_filter import EdgeFilter
-        
-        # Check if opportunity meets immediate trading criteria using edge filter
-        should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
-            ai_probability=opportunity.predicted_probability,
-            market_probability=opportunity.market_probability,
-            confidence=opportunity.confidence,
-            additional_filters={
-                'volume': getattr(opportunity, 'volume', 1000),
-                'min_volume': 1000,
-                'time_to_expiry_days': opportunity.time_to_expiry,
-                'max_time_to_expiry': 365
-            }
-        )
-        
-        # Additional criteria for immediate execution - MORE AGGRESSIVE
-        strong_opportunity = (
-            should_trade and
-            edge_result.edge_percentage >= 0.10 and  # DECREASED: 10% edge for immediate execution (was 18%)
-            opportunity.confidence >= 0.60 and       # DECREASED: 60% confidence (was 75%)
-            opportunity.expected_return >= 0.05      # DECREASED: 5% expected return (was 8%)
-        )
-        
-        if not strong_opportunity:
-            return  # Not strong enough for immediate action
-        
-        # Check position limits and get maximum allowed position size
-        from src.utils.position_limits import check_can_add_position
-        
-        # Get portfolio value for position sizing
-        try:
-            balance_response = await kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100  # Convert cents to dollars
-            
-            # Get current positions to calculate total portfolio value
-            positions_response = await kalshi_client.get_positions()
-            positions = positions_response.get('positions', []) if isinstance(positions_response, dict) else []
-            total_position_value = 0
-            
-            if positions:
-                for position in positions:
-                    if not isinstance(position, dict):
-                        continue  # Skip non-dict positions
-                    quantity = position.get('quantity', 0)
-                    # Get current market price for this position
-                    market_id = position.get('market_id')
-                    if market_id and quantity != 0:
-                        try:
-                            market_data = await kalshi_client.get_market(market_id)
-                            market_info = market_data.get('market', {})
-                            if position.get('side') == 'yes':
-                                current_price = market_info.get('yes_price', 50) / 100
-                            else:
-                                current_price = market_info.get('no_price', 50) / 100
-                            position_value = abs(quantity) * current_price
-                            total_position_value += position_value
-                        except:
-                            # If we can't get market data, estimate at entry price
-                            total_position_value += abs(quantity) * 0.50  # Conservative 50¢ estimate
-            
-            total_portfolio_value = available_cash + total_position_value
-            logger.info(f"💰 Portfolio value: Cash=${available_cash:.2f} + Positions=${total_position_value:.2f} = Total=${total_portfolio_value:.2f}")
-            
-        except Exception as e:
-            logger.warning(f"Could not get portfolio value, using available cash: {e}")
-            total_portfolio_value = total_capital
-            available_cash = total_capital
-        
-        # Calculate Kelly-optimal position size
-        kelly_fraction = _calculate_simple_kelly(opportunity)
-        kelly_multiplier = settings.trading.kelly_fraction  # Use configured Kelly fraction (0.75)
-        kelly_position_size = kelly_fraction * kelly_multiplier * total_portfolio_value
-        
-        # Safety cap: never exceed configured max per position
-        max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
-        safety_cap = total_portfolio_value * max_single_position_pct
-        
-        # Cash availability constraint
-        cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
-        
-        # Initial position size: Kelly-optimal, but capped for safety and cash availability
-        initial_position_size = min(
-            kelly_position_size,  # Kelly-optimal size
-            safety_cap,          # Safety cap (5% max)
-            cash_limit           # Available cash constraint
-        )
-        
-        # Check position limits with actual calculated size
-        can_add_position, limit_reason = await check_can_add_position(
-            initial_position_size, db_manager, kalshi_client
-        )
-        
-        if not can_add_position:
-            # Instead of blocking, try to find a smaller position size that fits
-            logger.info(f"⚠️ Position size ${initial_position_size:.2f} exceeds limits, attempting to reduce...")
-            
-            # Try progressively smaller position sizes
-            for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
-                reduced_position_size = initial_position_size * reduction_factor
-                can_add_reduced, reduced_reason = await check_can_add_position(
-                    reduced_position_size, db_manager, kalshi_client
-                )
-                
-                if can_add_reduced:
-                    initial_position_size = reduced_position_size
-                    logger.info(f"✅ Position size reduced to ${initial_position_size:.2f} to fit limits")
-                    break
-            else:
-                # If even the smallest size doesn't fit, check if it's due to position count
-                from src.utils.position_limits import PositionLimitsManager
-                limits_manager = PositionLimitsManager(db_manager, kalshi_client)
-                current_positions = await limits_manager._get_position_count()
-                
-                if current_positions >= limits_manager.max_positions:
-                    logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
-                    return
-                else:
-                    logger.info(f"❌ POSITION SIZE LIMIT: Even minimum size ${initial_position_size * 0.1:.2f} exceeds limits")
-                    return
-        
-        logger.info(f"✅ POSITION LIMITS OK FOR IMMEDIATE TRADE: ${initial_position_size:.2f}")
-        
-        # Check if we already have a position in this market
-        import aiosqlite
-        async with aiosqlite.connect(db_manager.db_path) as db:
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM positions WHERE market_id = ?",
-                (opportunity.market_id,)
-            )
-            result = await cursor.fetchone()
-            position_count = result[0] if result else 0
-        
-        if position_count > 0:
-            logger.info(f"⏭️ Skipping immediate trade for {opportunity.market_id} - position already exists")
-            return
-        
-        # 🚀 STRONG OPPORTUNITY - TRADE IMMEDIATELY!
-        logger.info(f"🚀 IMMEDIATE TRADE: {opportunity.market_id} - Edge: {opportunity.edge:.1%}, Confidence: {opportunity.confidence:.1%}")
-        
-        # Use the position size that was already calculated and validated above
-        position_size = initial_position_size
-        
-        logger.info(f"💰 Using validated position size: ${position_size:.2f}")
-        
-        # Final cash reserves check with actual calculated size
-        from src.utils.cash_reserves import check_can_trade_with_cash_reserves
-        
-        can_trade_reserves, reserves_reason = await check_can_trade_with_cash_reserves(
-            position_size, db_manager, kalshi_client
-        )
-        
-        if not can_trade_reserves:
-            logger.info(f"❌ CASH RESERVES CHECK FAILED: {opportunity.market_id} - {reserves_reason}")
-            return
-        
-        logger.info(f"✅ CASH RESERVES APPROVED: ${position_size:.2f} - {reserves_reason}")
-        
-        # NO DOLLAR MINIMUM - we'll ensure at least 1 contract below
-        
-        # Determine side based on edge direction
-        side = "NO" if opportunity.edge < 0 else "YES"  # Negative edge = market overpriced = bet NO
-        
-        # Calculate proper entry price (what we expect to pay)
-        if side == "YES":
-            entry_price = opportunity.market_probability  # Price for YES shares
-            shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
-        else:
-            entry_price = 1 - opportunity.market_probability  # Price for NO shares  
-            shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
-        
-        # Verify we can afford at least 1 contract
-        min_cost = shares * entry_price
-        if min_cost > available_cash:
-            logger.info(f"⏭️ Cannot afford minimum 1 contract: ${min_cost:.2f} > ${available_cash:.2f}")
-            return
-            
-        logger.info(f"📊 Trade details: {shares} {side} shares @ ${entry_price:.2f} = ${min_cost:.2f}")
-        
-        # Calculate proper stop-loss levels using Grok4 recommendations
-        from src.utils.stop_loss_calculator import StopLossCalculator
-        
-        exit_levels = StopLossCalculator.calculate_stop_loss_levels(
-            entry_price=entry_price,
-            side=side,
-            confidence=opportunity.confidence,
-            market_volatility=opportunity.volatility,
-            time_to_expiry_days=opportunity.time_to_expiry
-        )
-        
-        # Create position directly
-        from src.utils.database import Position
-        from src.jobs.execute import execute_position
-        
-        position = Position(
-            market_id=opportunity.market_id,
-            side=side,
-            quantity=shares,
-            entry_price=entry_price,
-            live=False,  # Will be set to True ONLY after successful execution
-            timestamp=datetime.now(),
-            rationale=f"IMMEDIATE TRADE: Edge={opportunity.edge:.1%}, Conf={opportunity.confidence:.1%}, Kelly={kelly_fraction:.1%}, Stop={exit_levels['stop_loss_pct']}%",
-            strategy="immediate_portfolio_optimization",
-            
-            # Enhanced exit strategy using Grok4 recommendations
-            stop_loss_price=exit_levels['stop_loss_price'],
-            take_profit_price=exit_levels['take_profit_price'],
-            max_hold_hours=exit_levels['max_hold_hours'],
-            target_confidence_change=exit_levels['target_confidence_change']
-        )
-        
-        # 🚨 VALIDATE MARKET IS STILL TRADEABLE before executing
-        try:
-            market_data = await kalshi_client.get_market(opportunity.market_id)
-            
-            # FIXED: Extract from nested 'market' object in API response
-            market_info = market_data.get('market', {})
-            market_status = market_info.get('status')
-            yes_ask = market_info.get('yes_ask', 0)
-            no_ask = market_info.get('no_ask', 0)
-            
-            logger.info(f"🔍 Market validation for {opportunity.market_id}: status={market_status}, YES={yes_ask}¢, NO={no_ask}¢")
-            
-            # FIXED: Kalshi uses 'active' for tradeable markets, not 'open'
-            if market_status not in ['active', 'open']:
-                logger.warning(f"⏭️ Skipping {opportunity.market_id} - Market status: {market_status} (not active/open)")
-                return
-            
-            if not (yes_ask and no_ask and yes_ask > 0 and no_ask > 0):
-                logger.warning(f"⏭️ Skipping {opportunity.market_id} - No valid prices (YES={yes_ask}¢, NO={no_ask}¢)")
-                return
-                
-            logger.info(f"✅ Market validation passed for {opportunity.market_id} - Status: {market_status}, proceeding with trade!")
-            
-        except Exception as e:
-            logger.error(f"⏭️ Skipping {opportunity.market_id} - Market validation failed: {e}")
-            import traceback
-            logger.error(f"Full error: {traceback.format_exc()}")
-            return
-        
-        # Execute immediately
-        position_id = await db_manager.add_position(position)
-        if position_id:
-            # Set the position ID so execute_position can update the database
-            position.id = position_id
-            
-            # Execute the trade (live_mode=True for immediate trades)
-            success = await execute_position(position, True, db_manager, kalshi_client)
-            if success:
-                logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
-            else:
-                logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
-        
-    except Exception as e:
-        logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
-
-def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
-    """Calculate simple Kelly fraction for immediate trading."""
-    try:
-        # Simple Kelly: (bp - q) / b
-        # where b = odds, p = win probability, q = lose probability
-        if opportunity.edge > 0:  # Betting YES
-            p = opportunity.predicted_probability
-            q = 1 - p
-            b = (1 - opportunity.market_probability) / opportunity.market_probability
-        else:  # Betting NO
-            p = 1 - opportunity.predicted_probability  
-            q = opportunity.predicted_probability
-            b = opportunity.market_probability / (1 - opportunity.market_probability)
-        
-        kelly = (b * p - q) / b
-        return max(0, min(kelly, 0.2))  # Cap at 20%
-        
-    except:
-        return 0.05  # Default 5% allocation
-
-
-async def _get_fast_ai_prediction(
-    market: Market,
-    xai_client: XAIClient,
-    market_price: float
-) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Get a fast AI prediction for a market without expensive analysis.
-    Returns (predicted_probability, confidence) or (None, None) if failed.
-    """
-    try:
-        # Create a simplified prompt for faster analysis
-        prompt = f"""
-        QUICK PREDICTION REQUEST
-        
-        Market: {market.title}
-        Current YES price: {market_price:.2f}
-        
-        Provide a FAST prediction in JSON format:
-        {{
-            "probability": [0.0-1.0],
-            "confidence": [0.0-1.0],
-            "reasoning": "brief 1-2 sentence explanation"
-        }}
-        
-        Focus on: probability estimate and your confidence level.
-        """
-        
-        # Use AI analysis for portfolio optimization - higher tokens for reasoning models  
-        response_text = await xai_client.get_completion(
-            prompt,
-            max_tokens=3000,  # Higher for reasoning models like grok-4
-            temperature=0.1   # Low temperature for consistency
-        )
-        
-        # Check if AI response is None (API exhausted or failed)
-        if response_text is None:
-            logging.getLogger("portfolio_opportunities").info(f"AI analysis unavailable for {market.market_id} due to API limits")
-            return None, None
-        
-        # Parse JSON from the response text
-        try:
-            import json
-            import re
-            
-            # Try to extract JSON from the response
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                response = json.loads(json_str)
-            else:
-                # If no JSON found, try to parse the entire response
-                response = json.loads(response_text)
-            
-            if response and isinstance(response, dict):
-                probability = response.get('probability')
-                confidence = response.get('confidence')
-                
-                # Validate values
-                if (isinstance(probability, (int, float)) and 0 <= probability <= 1 and
-                    isinstance(confidence, (int, float)) and 0 <= confidence <= 1):
-                    return float(probability), float(confidence)
-            
-        except (json.JSONDecodeError, ValueError) as json_error:
-            logging.getLogger("portfolio_opportunities").warning(f"Failed to parse JSON from AI response for {market.market_id}: {json_error}")
-            logging.getLogger("portfolio_opportunities").debug(f"Raw response: {response_text}")
-        
-        return None, None
-        
-    except Exception as e:
-        logging.getLogger("portfolio_opportunities").error(f"Error in fast AI prediction for {market.market_id}: {e}")
-        return None, None
 
 
 async def run_portfolio_optimization(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
-    xai_client: XAIClient
+    xai_client: XAIClient,
+    odds_client: Optional[OddsClient] = None
 ) -> PortfolioAllocation:
-    """
-    Main entry point for portfolio optimization.
-    """
-    logger = get_trading_logger("portfolio_optimization_main")
-    
     try:
         # Initialize optimizer
-        optimizer = AdvancedPortfolioOptimizer(db_manager, kalshi_client, xai_client)
+        optimizer = AdvancedPortfolioOptimizer(db_manager, kalshi_client, xai_client, odds_client)
         
+        # 🟢 POLL REAL BALANCE (User Request: "poll actual balance")
+        try:
+             # Default capital baseline (Budget)
+             current_capital = settings.trading.daily_budget
+             
+             # Fetch real balance from Kalshi
+             balance_data = await kalshi_client.get_balance()
+             if balance_data and 'balance' in balance_data:
+                 real_balance_dollars = balance_data['balance'] / 100.0
+                 logger.info(f"💰 Account Balance: ${real_balance_dollars:.2f} (Budget: ${current_capital})")
+                 
+                 # Apply Reality Check: Can't trade more than account balance.
+                 # Even in simulation, sizing positions based on $10k when you have $50 leads to failure.
+                 if real_balance_dollars < current_capital and not settings.trading.paper_mode:
+                     logger.warning(f"⚠️ Adjusting capital base: ${current_capital} -> ${real_balance_dollars:.2f} (capped by actual funds)")
+                     current_capital = real_balance_dollars
+                 elif real_balance_dollars < current_capital and settings.trading.paper_mode:
+                     # In paper mode, we might WANT to simulate a larger bankroll. 
+                     # But user asked to "know what to apply kelly criterion to".
+                     # Let's log it.
+                     pass
+
+             # Update optimizer's capital base for Kelly calculations
+             optimizer.total_capital = current_capital
+             
+        except Exception as e:
+            logger.warning(f"Failed to check real balance: {e}")
+
         # Get markets
         markets = await db_manager.get_eligible_markets(
-            volume_min=20000,  # Balanced volume for actual trading opportunities
-            max_days_to_expiry=365  # Accept any timeline with dynamic exits
+            volume_min=settings.trading.min_volume,
+            max_days_to_expiry=settings.trading.max_time_to_expiry_days
         )
         if not markets:
             logger.warning("No eligible markets for portfolio optimization")
@@ -1306,7 +1024,7 @@ async def run_portfolio_optimization(
         
         # Convert to opportunities (no immediate trading in batch mode)
         opportunities = await create_market_opportunities_from_markets(
-            markets, xai_client, kalshi_client, None, 0
+            markets, xai_client, kalshi_client, None, 0, odds_client
         )
         
         if not opportunities:
@@ -1329,3 +1047,137 @@ async def run_portfolio_optimization(
     except Exception as e:
         logger.error(f"Error in portfolio optimization: {e}")
         return AdvancedPortfolioOptimizer(db_manager, kalshi_client, xai_client)._empty_allocation() 
+
+
+async def _get_fast_ai_prediction(
+    market: Market,
+    xai_client: XAIClient,
+    market_prob: float,
+    odds_context: str,
+    db_manager: Optional[DatabaseManager] = None,
+    arbitrage_engine: Optional[Any] = None
+) -> Tuple[float, float, Optional[int]]:
+    """
+    Get a quick AI prediction using a cheaper/faster prompt.
+    Returns: (predicted_probability, confidence, decision_id)
+    """
+    
+    # 🔍 POLYMARKET ARBITRAGE CHECK
+    arbitrage_context = ""
+    if arbitrage_engine:
+        # Check for fuzzy match
+        arb_match = arbitrage_engine.get_polymarket_match(market.title)
+        if arb_match:
+            arbitrage_context = (
+                f"\n\n🚨 ***POLYMARKET ARBITRAGE DATA*** 🚨\n"
+                f"MATCHED EVENT: {arb_match.title}\n"
+                f"POLYMARKET PRICES: YES {arb_match.yes_price}, NO {arb_match.no_price}\n"
+                f"VOLUME: ${arb_match.volume:,.0f}\n"
+                f"IMPLIED ODDS: {arb_match.yes_price:.2%}\n"
+                f"KALSHI ODDS: {market_prob:.2%}\n"
+                f"SPREAD: {abs(arb_match.yes_price - market_prob):.2%}\n"
+                f"Strategy: If the spread is > 5%, TRUST POLYMARKET as the 'True Price'. arbitrage away the difference.\n"
+            )
+
+    system_prompt = "You are a professional super-forecaster. Analyze the market and provide a probability estimate."
+    
+    user_prompt = f"""
+    Analyze this prediction market:
+    Question: {market.title}
+    Category: {market.category}
+    Current Market Price (Probability): {market_prob:.2%}
+    
+    External Odds Context: {odds_context}
+    {arbitrage_context}
+    
+    Instructions:
+    1. CRITICAL: If 'External Odds Context' or 'Arbitrage Data' is present, YOU MUST ALIGN YOUR PREDICTION WITH IT.
+    2. Do not invent reasons to disagree with the market unless you have overwhelming proof.
+    3. If the spread (Arbitrage) is > 5%, TRUST THE EXTERNAL ODDS.
+    4. If no odds, use general knowledge.
+    5. If Sport/Politics and NO odds, be extremely conservative (Confidence < 0.2).
+    
+    Output JSON:
+    {{
+        "probability": 0.0 to 1.0,
+        "confidence": 0.0 to 1.0,
+        "reasoning": "brief explanation"
+    }}
+    """
+    
+    try:
+        response = await xai_client.get_completion(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            response_format={"type": "json_object"}
+        )
+        
+        # Parse response
+        import json
+        data = json.loads(response)
+        
+        pred_prob = float(data.get('probability', 0.5))
+        confidence = float(data.get('confidence', 0.5))
+        reasoning = data.get('reasoning', 'No reasoning provided')
+        
+        # 🚨 SAFETY LATCH: FORCE ALIGNMENT WITH REAL DATA 🚨
+        if arbitrage_engine and arbitrage_context:
+            # Extract implied odds from context (hacky but effective)
+            # Re-fetch is safer but expensive. Let's rely on the engine we passed.
+            arb_match = arbitrage_engine.get_polymarket_match(market.title)
+            if arb_match:
+                poly_price = arb_match.yes_price
+                diff = abs(pred_prob - poly_price)
+                if diff > 0.10: # If AI deviates > 10% from Polymarket
+                    # Force correction
+                    reasoning += f" [AUTO-CORRECTED: AI deviated {diff:.2%} from Polymarket ({poly_price:.2%}). Snapping to reality.]"
+                    pred_prob = poly_price # Trust the market
+                    confidence = 0.90 # High confidence in the arbitrage
+
+        
+        # 💾 Save decision to DB if db_manager provided
+        decision_id = None
+        if db_manager:
+            from src.utils.database import TrainingExample
+            from datetime import datetime
+            
+            # Simple decision log
+            decision_id = await db_manager.log_ai_analysis(
+                market_id=market.market_id,
+                market_question=market.title,
+                ai_response=response,
+                prompt_used=user_prompt,
+                initial_price=market_prob,
+                predicted_prob=pred_prob,
+                confidence=confidence,
+                decision_pnl=0.0 # Unknown yet
+            )
+            
+            # Detailed Training Example
+            example = TrainingExample(
+                market_ticker=market.market_id,
+                market_question=market.title,
+                timestamp=datetime.now().isoformat(),
+                current_price=market_prob,
+                news_context=odds_context + arbitrage_context,
+                ai_reasoning=reasoning,
+                ai_prediction=pred_prob,
+                ai_confidence=confidence,
+                decision_id=decision_id
+            )
+            await db_manager.save_training_example(example)
+            
+        return pred_prob, confidence, decision_id
+        
+    except Exception as e:
+        import traceback
+        # logger is not available in this scope? It's a method on self? No, this is a standalone function?
+        # It's a static method or standalone?
+        # Let's check imports.
+        # It's an instance method? No, indentation suggests it's a standalone function.
+        # I need to get a logger.
+        from src.utils.logging_setup import get_trading_logger
+        l = get_trading_logger("fast_ai_prediction")
+        l.error(f"Prediction failed for {market.market_id}: {e}")
+        l.error(traceback.format_exc())
+        return 0.5, 0.0, None

@@ -23,8 +23,8 @@ scipy>=1.12.0       # For portfolio optimization (Python 3.13 compatible)
 python-dotenv==1.0.0
 
 # Pydantic and data validation
-# Using a version compatible with Python 3.13
-pydantic==2.8.2
+# Using a version compatible with Python 3.13+
+pydantic>=2.10.0
 pydantic-settings
 
 # Logging and monitoring
@@ -35,8 +35,6 @@ typing-extensions>=4.11
 
 # Date/time handling
 python-dateutil==2.8.2
-pytz==2023.3
-
 # Rate limiting
 ratelimit==2.2.1
 
@@ -58,3 +56,5 @@ black==23.12.1
 isort==5.13.2 
 uvicorn
 json-repair 
+streamlit
+plotly

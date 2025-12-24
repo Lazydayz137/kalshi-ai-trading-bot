@@ -19,19 +19,7 @@ from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
 from src.utils.prompts import MULTI_AGENT_PROMPT_TPL
 
 
-@dataclass
-class TradingDecision:
-    """Represents an AI trading decision."""
-    action: str  # "buy", "sell", "hold"
-    side: str    # "yes", "no"
-    confidence: float  # 0.0 to 1.0
-    reasoning: str
-    position_size_pct: float  # Percentage of available capital to use
-    max_price: Optional[float] = None  # Maximum price willing to pay
-    stop_loss: Optional[float] = None  # Stop loss price
-    take_profit: Optional[float] = None  # Take profit price
-    expected_return: Optional[float] = None  # Expected return percentage
-    risk_assessment: Optional[str] = None  # Risk level assessment
+from src.utils.structs import TradingDecision, AIDecisionResult
 
 
 @dataclass
@@ -54,15 +42,17 @@ class OpenAIClient(TradingLoggerMixin):
     Uses OpenAI models for market analysis and trading strategy.
     """
     
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, db_manager=None):
         """
         Initialize OpenAI client.
         
         Args:
             api_key: OpenAI API key (defaults to settings)
+            db_manager: Optional DatabaseManager (for compatibility with XAIClient interface)
         """
         self.api_key = api_key or settings.api.openai_api_key
         self.base_url = settings.api.openai_base_url
+        self.db_manager = db_manager
         
         # Initialize OpenAI client
         self.client = AsyncOpenAI(
@@ -82,43 +72,74 @@ class OpenAIClient(TradingLoggerMixin):
         self.total_cost = 0.0
         self.request_count = 0
         
+        # Mock daily_tracker for compatibility with beast_mode_bot checks
+        # In the future, we should implement real tracking here too
+        from dataclasses import dataclass
+        @dataclass
+        class MockTracker:
+            is_exhausted: bool = False
+            total_cost: float = 0.0
+            request_count: int = 0
+            daily_limit: float = 50.0
+
+        self.daily_tracker = MockTracker(
+            daily_limit=getattr(settings.trading, 'daily_ai_cost_limit', 50.0)
+        )
+        
         self.logger.info(
             "OpenAI client initialized",
             primary_model=self.primary_model,
             fallback_model=self.fallback_model
         )
+
+    async def search(self, query: str, max_length: int = 300) -> str:
+        """
+        Dummy search method for compatibility with XAIClient.
+        OpenAI/OpenRouter models (generic) do not support live search in this context.
+        """
+        self.logger.info(f"Search requested for '{query[:30]}...' but not supported by OpenAIClient. Returning empty.")
+        return ""
     
     async def get_trading_decision(
         self,
         market_data: Dict[str, Any],
         portfolio_data: Dict[str, Any],
         news_summary: str
-    ) -> TradingDecision:
+    ) -> AIDecisionResult:
         """
         Get a trading decision from the AI model.
+        Returns detailed result including prompt/response for training.
         """
         prompt = self._prepare_prompt(market_data, portfolio_data, news_summary)
         messages = [{"role": "user", "content": prompt}]
 
-        response_content, cost = await self._make_completion_request(messages)
-
-        # The model is expected to return a dialogue, with the Trader's response being a JSON object.
-        # We need to extract that JSON object from the response.
         try:
-            # Find the last JSON object in the response
-            json_str = response_content[response_content.rfind('{'):response_content.rfind('}')+1]
-            decision_json = self._parse_json_response(json_str, "trading_decision")
-        except (ValueError, IndexError):
-            self.logger.error("Failed to extract or parse JSON from model response.", response=response_content)
-            raise ValueError("Invalid JSON response from model")
+            response_content, cost = await self._make_completion_request(messages)
 
-        return TradingDecision(
-            action=decision_json.get("action", "SKIP"),
-            side=decision_json.get("side"),
-            confidence=decision_json.get("confidence", 0.0),
-            reasoning=decision_json.get("rationale", "No rationale provided."),
-            position_size_pct=0 # This can be enhanced later
-        )
+            # The model is expected to return a dialogue, with the Trader's response being a JSON object.
+            # We need to extract that JSON object from the response.
+            try:
+                # Find the last JSON object in the response
+                json_str = response_content[response_content.rfind('{'):response_content.rfind('}')+1]
+                decision_json = self._parse_json_response(json_str, "trading_decision")
+                
+                decision = TradingDecision(
+                    action=decision_json.get("action", "SKIP"),
+                    side=decision_json.get("side", "YES"),
+                    confidence=float(decision_json.get("confidence", 0.0)),
+                    reasoning=decision_json.get("rationale", "No rationale provided."),
+                    position_size_pct=0.0 # This can be enhanced later
+                )
+                
+                return AIDecisionResult(decision, prompt, response_content, self.primary_model)
+                
+            except (ValueError, IndexError, AttributeError) as e:
+                self.logger.error("Failed to extract or parse JSON from model response.", response=response_content)
+                return AIDecisionResult(None, prompt, response_content, self.primary_model)
+                
+        except Exception as e:
+            self.logger.error(f"Error in get_trading_decision: {str(e)}")
+            return AIDecisionResult(None, prompt, str(e), self.primary_model)
 
     def _prepare_prompt(
         self,
@@ -184,6 +205,11 @@ class OpenAIClient(TradingLoggerMixin):
         
         for attempt in range(max_retries + 1):
             try:
+                # Map internal model names to OpenRouter IDs if needed
+                if model == "grok-4":
+                     # Use Grok 2 as the closest available equivalent on OpenRouter
+                     model = "xai/grok-2-1212"
+                
                 start_time = time.time()
                 
                 kwargs = {
@@ -376,6 +402,88 @@ class OpenAIClient(TradingLoggerMixin):
         """Returns a fallback response when JSON parsing fails."""
         self.logger.error("JSON parsing and repair failed, returning fallback.", context=context)
         raise ValueError("Failed to get a valid JSON response from the model.")
+
+    async def _log_query(
+        self,
+        strategy: str,
+        query_type: str,
+        prompt: str,
+        response: str,
+        market_id: Optional[str] = None,
+        cost_usd: float = 0.0
+    ):
+        """Log LLM query to database."""
+        if self.db_manager:
+            try:
+                from src.utils.database import LLMQuery
+                
+                # Estimate tokens if not provided (rough estimate)
+                tokens_used = (len(prompt) + len(response)) // 4
+                
+                query = LLMQuery(
+                    timestamp=datetime.now(),
+                    strategy=strategy,
+                    query_type=query_type,
+                    market_id=market_id or "unknown",
+                    prompt=prompt,
+                    response=response,
+                    tokens_used=tokens_used,
+                    cost_usd=cost_usd,
+                    confidence_extracted=0.0,
+                    decision_extracted="UNKNOWN"
+                )
+                
+                await self.db_manager.log_llm_query(query)
+                
+            except Exception as e:
+                self.logger.error(f"Failed to log LLM query: {e}")
+
+    async def get_completion(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        strategy: str = "unknown",
+        query_type: str = "completion",
+        market_id: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Get a simple completion from the AI model.
+        Returns the raw response text or None if failed/exhausted.
+        """
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response_content, cost = await self._make_completion_request(
+                messages, 
+                max_tokens=max_tokens, 
+                temperature=temperature
+            )
+            
+            # Check if we got a None response (API exhausted or failed)
+            if response_content is None:
+                self.logger.info(
+                    "AI completion skipped due to API limits or exhaustion",
+                    strategy=strategy,
+                    query_type=query_type,
+                    market_id=market_id
+                )
+                return None
+            
+            # Log the query and response
+            await self._log_query(
+                strategy=strategy,
+                query_type=query_type,
+                prompt=prompt,
+                response=response_content,
+                market_id=market_id,
+                cost_usd=cost
+            )
+            
+            return response_content
+                    
+        except Exception as e:
+            self.logger.error(f"Error in get_completion: {e}")
+            return None
 
     async def close(self) -> None:
         """Close the OpenAI client session."""

@@ -43,7 +43,24 @@ class Position:
     stop_loss_price: Optional[float] = None
     take_profit_price: Optional[float] = None
     max_hold_hours: Optional[int] = None  # Maximum hours to hold position
+    max_hold_hours: Optional[int] = None  # Maximum hours to hold position
     target_confidence_change: Optional[float] = None  # Exit if confidence drops by this amount
+    decision_id: Optional[int] = None  # Link to the AI decision that caused this position
+
+@dataclass
+class TrainingExample:
+    """Represents a labeled training example for fine-tuning."""
+    market_id: str
+    timestamp: datetime
+    model_name: str
+    input_state: str  # JSON string of market state
+    news_context: str  # JSON string of news
+    prompt_template: str
+    model_response: str
+    parsed_decision: str  # JSON string of decision
+    realized_pnl: Optional[float] = None
+    outcome_score: Optional[int] = None  # 1 (Good), -1 (Bad), 0 (Neutral)
+    id: Optional[int] = None
 
 @dataclass
 class TradeLog:
@@ -58,6 +75,7 @@ class TradeLog:
     exit_timestamp: datetime
     rationale: str
     strategy: Optional[str] = None  # Strategy that created this trade
+    decision_id: Optional[int] = None  # Link to the AI decision
     id: Optional[int] = None
 
 @dataclass
@@ -134,8 +152,17 @@ class DatabaseManager(TradingLoggerMixin):
                         decision_extracted TEXT
                     )
                 """)
-                
-                            # Migration 4: Update existing positions with strategy based on rationale
+
+            # Migration 4: Add decision_id to trade_logs
+            cursor = await db.execute("PRAGMA table_info(trade_logs)")
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            
+            if 'decision_id' not in column_names:
+                self.logger.info("Adding decision_id column to trade_logs table")
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN decision_id INTEGER")
+
+             # Migration 5: Update existing positions with strategy based on rationale
             await self._migrate_existing_strategy_data(db)
             
         except Exception as e:
@@ -248,7 +275,24 @@ class DatabaseManager(TradingLoggerMixin):
                 take_profit_price REAL,
                 max_hold_hours INTEGER,
                 target_confidence_change REAL,
+                decision_id INTEGER,
                 UNIQUE(market_id, side)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS training_examples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                input_state TEXT NOT NULL,
+                news_context TEXT NOT NULL,
+                prompt_template TEXT NOT NULL,
+                model_response TEXT NOT NULL,
+                parsed_decision TEXT NOT NULL,
+                realized_pnl REAL,
+                outcome_score INTEGER
             )
         """)
 
@@ -353,6 +397,19 @@ class DatabaseManager(TradingLoggerMixin):
             if 'target_confidence_change' not in column_names:
                 await db.execute("ALTER TABLE positions ADD COLUMN target_confidence_change REAL")
                 self.logger.info("Added target_confidence_change column to positions table")
+
+            if 'decision_id' not in column_names:
+                await db.execute("ALTER TABLE positions ADD COLUMN decision_id INTEGER")
+                self.logger.info("Added decision_id column to positions table")
+                
+            # Check trade_logs for decision_id
+            cursor = await db.execute("PRAGMA table_info(trade_logs)")
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            
+            if 'decision_id' not in column_names:
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN decision_id INTEGER")
+                self.logger.info("Added decision_id column to trade_logs table")
                 
             await db.commit()
             
@@ -415,7 +472,7 @@ class DatabaseManager(TradingLoggerMixin):
                     volume >= ? AND
                     expiration_ts > ? AND
                     expiration_ts <= ? AND
-                    status = 'active' AND
+                    status IN ('active', 'open') AND
                     has_position = 0
             """, (volume_min, now_ts, max_expiry_ts))
             rows = await cursor.fetchall()
@@ -562,8 +619,8 @@ class DatabaseManager(TradingLoggerMixin):
         
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-                INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy)
-                VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy)
+                INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy, decision_id)
+                VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy, :decision_id)
             """, trade_dict)
             await db.commit()
             self.logger.info(f"Added trade log for market {trade_log.market_id}.")
@@ -798,21 +855,55 @@ class DatabaseManager(TradingLoggerMixin):
                 rows = await cursor.fetchall()
                 
                 stats = {}
-                for row in rows:
-                    stats[row['strategy']] = {
-                        'query_count': row['query_count'],
-                        'total_tokens': row['total_tokens'] or 0,
-                        'total_cost': row['total_cost'] or 0.0,
-                        'avg_confidence': row['avg_confidence'] or 0.0,
-                        'first_query': row['first_query'],
-                        'last_query': row['last_query']
-                    }
-                
                 return stats
                 
         except Exception as e:
             self.logger.error(f"Error getting LLM stats: {e}")
             return {}
+
+    async def save_training_example(self, example: TrainingExample) -> int:
+        """
+        Save a training example to the database.
+        Returns the ID of the inserted example.
+        """
+        try:
+            example_dict = asdict(example)
+            example_dict['timestamp'] = example.timestamp.isoformat()
+            
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("""
+                    INSERT INTO training_examples (
+                        market_id, timestamp, model_name, input_state, news_context,
+                        prompt_template, model_response, parsed_decision,
+                        realized_pnl, outcome_score
+                    ) VALUES (
+                        :market_id, :timestamp, :model_name, :input_state, :news_context,
+                        :prompt_template, :model_response, :parsed_decision,
+                        :realized_pnl, :outcome_score
+                    )
+                """, example_dict)
+                await db.commit()
+                return cursor.lastrowid
+                
+        except Exception as e:
+            self.logger.error(f"Error saving training example: {e}")
+            return 0
+
+    async def update_training_outcome(self, decision_id: int, pnl: float, score: int) -> None:
+        """Update the outcome of a training example based on realized PnL."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    UPDATE training_examples 
+                    SET realized_pnl = ?, outcome_score = ?
+                    WHERE id = ?
+                """, (pnl, score, decision_id))
+                await db.commit()
+                self.logger.info(f"Updated training example {decision_id} with PnL ${pnl:.2f}")
+                
+        except Exception as e:
+            self.logger.error(f"Error updating training outcome: {e}")
+
 
     async def close(self):
         """Close database connections (no-op for aiosqlite)."""
@@ -946,18 +1037,54 @@ class DatabaseManager(TradingLoggerMixin):
             # aiosqlite does not support dataclasses with datetime objects
             position_dict['timestamp'] = position.timestamp.isoformat()
 
-            cursor = await db.execute("""
-                INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change)
-                VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change)
-            """, position_dict)
-            await db.commit()
-            
-            # Set has_position to True for the market
-            await db.execute("UPDATE markets SET has_position = 1 WHERE market_id = ?", (position.market_id,))
-            await db.commit()
+            try:
+                cursor = await db.execute("""
+                    INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change, decision_id)
+                    VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change, :decision_id)
+                """, position_dict)
+                await db.commit()
+                
+                # Set has_position to True for the market
+                await db.execute("UPDATE markets SET has_position = 1 WHERE market_id = ?", (position.market_id,))
+                await db.commit()
 
-            self.logger.info(f"Added position for market {position.market_id}", position_id=cursor.lastrowid)
-            return cursor.lastrowid
+                self.logger.info(f"Added position for market {position.market_id}", position_id=cursor.lastrowid)
+                return cursor.lastrowid
+                
+            except aiosqlite.IntegrityError:
+                # Handle Unique Constraint Violation (likely a closed position exists)
+                self.logger.warning(f"IntegrityError inserting position {position.market_id} {position.side}. Checking for closed position to cleanup.")
+                
+                # Check if a closed position exists
+                cursor = await db.execute(
+                    "SELECT id FROM positions WHERE market_id = ? AND side = ? AND status = 'closed'", 
+                    (position.market_id, position.side)
+                )
+                closed_row = await cursor.fetchone()
+                
+                if closed_row:
+                    closed_id = closed_row[0]
+                    self.logger.info(f"Found closed position {closed_id} for {position.market_id}. Deleting to allow re-entry.")
+                    
+                    # Delete the old closed position to free up the unique constraint
+                    await db.execute("DELETE FROM positions WHERE id = ?", (closed_id,))
+                    await db.commit()
+                    
+                    # Retry Insert
+                    cursor = await db.execute("""
+                        INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change, decision_id)
+                        VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change, :decision_id)
+                    """, position_dict)
+                    await db.commit()
+                    
+                    await db.execute("UPDATE markets SET has_position = 1 WHERE market_id = ?", (position.market_id,))
+                    await db.commit()
+                    
+                    self.logger.info(f"Successfully re-entered market {position.market_id} after cleanup.", position_id=cursor.lastrowid)
+                    return cursor.lastrowid
+                else:
+                    self.logger.error(f"IntegrityError but no closed position found for {position.market_id}. Duplicate active position?")
+                    return None
 
     async def get_open_positions(self) -> List[Position]:
         """Get all open positions."""
@@ -984,7 +1111,8 @@ class DatabaseManager(TradingLoggerMixin):
                     stop_loss_price=row[10],
                     take_profit_price=row[11],
                     max_hold_hours=row[12],
-                    target_confidence_change=row[13]
+                    target_confidence_change=row[13],
+                    decision_id=row[14] if len(row) > 14 else None
                 )
                 positions.append(position)
             

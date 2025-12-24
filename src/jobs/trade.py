@@ -21,7 +21,9 @@ from datetime import datetime
 from typing import Optional
 
 from src.clients.kalshi_client import KalshiClient
+from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
+from src.clients.odds_client import OddsClient
 from src.utils.database import DatabaseManager
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
@@ -60,7 +62,23 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
         # Initialize clients
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()
-        xai_client = XAIClient(db_manager=db_manager)  # Pass db_manager for LLM logging
+        
+        # Choose AI client based on available keys
+        if settings.api.xai_api_key:
+            xai_client = XAIClient(db_manager=db_manager)
+        elif settings.api.openai_api_key:
+            logger.info("Using OpenAI/OpenRouter client as XAI key is missing")
+            from src.clients.openai_client import OpenAIClient
+            xai_client = OpenAIClient(db_manager=db_manager)
+        else:
+            logger.error("No valid AI API key found")
+            return None
+
+        # Initialize Odds Client
+        odds_client = None
+        if settings.api.odds_api_key:
+            odds_client = OddsClient()
+            logger.info("✅ Odds API Client initialized")
         
         # Configure the unified system
         # Use default settings unless overridden
@@ -89,8 +107,13 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
         # Execute the unified trading system
         logger.info("🎯 Executing Unified Advanced Trading System")
         results = await run_unified_trading_system(
-            db_manager, kalshi_client, xai_client, config
+            db_manager=db_manager,
+            kalshi_client=kalshi_client,
+            xai_client=xai_client,
+            config=config,
+            odds_client=odds_client
         )
+
         
         # Log comprehensive results
         if results.total_positions > 0:
@@ -133,14 +156,24 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
     try:
         logger.info("🔄 Executing fallback legacy trading system")
         
-        # Initialize components
+        # Initialize clients
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()
-        xai_client = XAIClient()
+        
+        # Choose AI client based on available keys
+        if settings.api.xai_api_key:
+            xai_client = XAIClient(db_manager=db_manager)
+        elif settings.api.openai_api_key:
+            logger.info("Using OpenAI/OpenRouter client as XAI key is missing")
+            from src.clients.openai_client import OpenAIClient
+            xai_client = OpenAIClient(db_manager=db_manager)
+        else:
+            logger.error("No valid AI API key found")
+            return TradingSystemResults()
         
         # Get eligible markets
         markets = await db_manager.get_eligible_markets(
-            volume_min=20000,  # Balanced volume for actual trading opportunities
+            volume_min=200,  # Balanced volume for actual trading opportunities
             max_days_to_expiry=365  # Accept any timeline with dynamic exits
         )
         if not markets:

@@ -7,26 +7,31 @@ import time
 import numpy as np
 from typing import Optional, Dict, Any
 from datetime import datetime
+import json
+from dataclasses import asdict
 
-from src.utils.database import DatabaseManager, Market, Position
+from src.utils.database import DatabaseManager, Market, Position, TrainingExample
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 from src.clients.xai_client import XAIClient
 from src.clients.kalshi_client import KalshiClient
+from src.utils.structs import AIDecisionResult
 
 
 def _calculate_dynamic_quantity(
     balance: float,
     market_price: float,
     confidence_delta: float,
+    days_to_expiry: float = 1.0  # New parameter for time-based scaling
 ) -> int:
     """
-    Calculates trade quantity based on portfolio balance and confidence delta.
+    Calculates trade quantity based on portfolio balance, confidence, and lockup period.
     
     Args:
         balance: Current available portfolio balance.
         market_price: The price of the contract (e.g., 0.90 for 90 cents).
         confidence_delta: The difference between LLM confidence and market price.
+        days_to_expiry: Days until capital is released (opportunity cost factor).
         
     Returns:
         The number of contracts to purchase.
@@ -40,7 +45,11 @@ def _calculate_dynamic_quantity(
     # Scale investment by how much our confidence differs from the market
     investment_scaler = 1 + (settings.trading.position_size_multiplier * confidence_delta)
     
-    investment_amount = (balance * base_investment_pct) * investment_scaler
+    # opportunity Cost Scaling: Decrease size for longer lockups
+    # 1 day = ~0.96x, 7 days = ~0.81x, 30 days = ~0.50x
+    time_factor = 1.0 / (1.0 + (days_to_expiry / 30.0))
+    
+    investment_amount = (balance * base_investment_pct) * investment_scaler * time_factor
     
     # Do not exceed the max position size
     max_investment = (balance * settings.trading.max_position_size_pct) / 100
@@ -51,6 +60,7 @@ def _calculate_dynamic_quantity(
     get_trading_logger("decision_engine").info(
         "Calculated dynamic position size.",
         investment_amount=final_investment,
+        time_factor=time_factor,
         quantity=quantity
     )
     
@@ -65,7 +75,7 @@ async def make_decision_for_market(
 ) -> Optional[Position]:
     """
     Analyzes a single market and makes a trading decision with performance optimizations.
-    Now includes cost controls and deduplication.
+    Now includes cost controls, deduplication, and data collection for model distillation.
     """
     logger = get_trading_logger("decision_engine")
     logger.info(f"Analyzing market: {market.title} ({market.market_id})")
@@ -129,17 +139,21 @@ async def make_decision_for_market(
                 # Skip expensive news search for high-confidence strategy to control costs
                 news_summary = f"Near-expiry high-confidence analysis. Market at {market.yes_price:.2f}"
                 
-                decision = await xai_client.get_trading_decision(
+                # Note: Assuming xai_client handles simple prompt logic internally or we adapt
+                # For high_confidence, we might want to capture training data too, but simplified for now
+                result = await xai_client.get_trading_decision(
                     market_data={"title": market.title, "yes_price": market.yes_price},
                     portfolio_data=portfolio_data,
                     news_summary=news_summary
                 )
                 
+                decision = result.decision
+                
                 # Estimate cost for high-confidence analysis (typically lower due to shorter prompts)
                 estimated_cost = 0.01  # Rough estimate for simple analysis
                 total_analysis_cost += estimated_cost
 
-                if decision.side == "YES" and decision.confidence >= settings.trading.high_confidence_threshold:
+                if decision and decision.side == "YES" and decision.confidence >= settings.trading.high_confidence_threshold:
                     logger.info(f"High-confidence YES opportunity found for {market.market_id}.")
                     
                     decision_action = "BUY"
@@ -151,7 +165,14 @@ async def make_decision_for_market(
                     )
                     
                     confidence_delta = decision.confidence - market.yes_price
-                    quantity = _calculate_dynamic_quantity(available_balance, market.yes_price, confidence_delta)
+                    # Use hours_to_expiry converted to days
+                    days_remaining = max(0.1, hours_to_expiry / 24.0)
+                    quantity = _calculate_dynamic_quantity(
+                        available_balance, 
+                        market.yes_price, 
+                        confidence_delta,
+                        days_to_expiry=days_remaining
+                    )
 
                     if quantity > 0:
                         # Calculate exit strategy using Grok4 recommendations  
@@ -232,25 +253,50 @@ async def make_decision_for_market(
             )
             return None
         
-        decision = await xai_client.get_trading_decision(
+        # Get AI Decision (returns AIDecisionResult)
+        result = await xai_client.get_trading_decision(
             market_data=market_data,
             portfolio_data=portfolio_data,
             news_summary=news_summary,
         )
 
-        # Estimate decision cost (this should come from the XAI client in the future)
         estimated_decision_cost = 0.015  # Rough estimate
         total_analysis_cost += estimated_decision_cost
 
-        if not decision:
+        if not result or not result.decision:
             logger.warning(f"No decision was made for market {market.market_id}. Skipping.")
             await db_manager.record_market_analysis(
                 market.market_id, "SKIP", 0.0, total_analysis_cost, "no_decision"
             )
             return None
 
+        # Extract Decision Data
+        decision = result.decision
         decision_action = decision.action
         confidence = decision.confidence
+        
+        # --- DATA ENGINE: Save Training Example ---
+        decision_id = None
+        try:
+            # Serialize decision for storage
+            parsed_decision_json = json.dumps(asdict(decision))
+            
+            training_example = TrainingExample(
+                market_id=market.market_id,
+                timestamp=datetime.now(),
+                model_name=result.model_name,
+                input_state=json.dumps(market_data, default=str),
+                news_context=news_summary,
+                prompt_template=result.prompt,
+                model_response=result.response_text,
+                parsed_decision=parsed_decision_json
+            )
+            
+            decision_id = await db_manager.save_training_example(training_example)
+            logger.info(f"Saved training example with ID: {decision_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save training example: {e}")
 
         logger.info(
             f"Generated decision for {market.market_id}: {decision.action} {decision.side} "
@@ -299,7 +345,13 @@ async def make_decision_for_market(
             
             # Calculate initial position size
             confidence_delta = decision.confidence - price
-            initial_quantity = _calculate_dynamic_quantity(available_balance, price, confidence_delta)
+            days_remaining = get_time_to_expiry_days(market)
+            initial_quantity = _calculate_dynamic_quantity(
+                available_balance, 
+                price, 
+                confidence_delta,
+                days_to_expiry=days_remaining
+            )
             initial_position_value = initial_quantity * price
             
             # Check if position can be added within limits and adjust if needed
@@ -389,12 +441,16 @@ async def make_decision_for_market(
                     rationale=rationale,
                     confidence=confidence,
                     live=False,
+                    strategy="directional_trading",
                     
                     # Enhanced exit strategy fields using Grok4 recommendations
                     stop_loss_price=exit_strategy['stop_loss_price'],
                     take_profit_price=exit_strategy['take_profit_price'],
                     max_hold_hours=exit_strategy['max_hold_hours'],
-                    target_confidence_change=exit_strategy['target_confidence_change']
+                    target_confidence_change=exit_strategy['target_confidence_change'],
+                    
+                    # Link to AI decision for training data
+                    decision_id=decision_id
                 )
                 return position
 

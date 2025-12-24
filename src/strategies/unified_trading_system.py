@@ -29,6 +29,7 @@ import numpy as np
 
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
+from src.clients.odds_client import OddsClient
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
@@ -42,100 +43,73 @@ from src.strategies.portfolio_optimization import (
     AdvancedPortfolioOptimizer, 
     MarketOpportunity, 
     PortfolioAllocation,
-    run_portfolio_optimization,
     create_market_opportunities_from_markets
 )
-from src.strategies.quick_flip_scalping import (
-    run_quick_flip_strategy,
-    QuickFlipConfig
-)
-
-
-@dataclass
-class TradingSystemConfig:
-    """Configuration for the unified trading system."""
-    # Capital allocation across strategies
-    market_making_allocation: float = 0.30  # 30% for market making
-    directional_trading_allocation: float = 0.40  # 40% for directional positions
-    quick_flip_allocation: float = 0.30     # 30% for quick flip scalping
-    arbitrage_allocation: float = 0.00      # 0% for arbitrage opportunities
-    
-    # Risk management
-    max_portfolio_volatility: float = 0.20  # 20% max portfolio vol
-    max_correlation_exposure: float = 0.70  # Max 70% in correlated positions
-    max_single_position: float = 0.15  # Max 15% in any single position
-    
-    # Performance targets
-    target_sharpe_ratio: float = 2.0
-    target_annual_return: float = 0.30  # 30% annual target
-    max_drawdown_limit: float = 0.15  # 15% max drawdown
-    
-    # Rebalancing
-    rebalance_frequency_hours: int = 6  # Rebalance every 6 hours
-    profit_taking_threshold: float = 0.25  # Take profits at 25%
-    loss_cutting_threshold: float = 0.10  # Cut losses at 10%
-
 
 @dataclass
 class TradingSystemResults:
-    """Results from unified trading system execution."""
-    # Market making results
-    market_making_orders: int = 0
-    market_making_exposure: float = 0.0
-    market_making_expected_profit: float = 0.0
-    
-    # Directional trading results
-    directional_positions: int = 0
-    directional_exposure: float = 0.0
-    directional_expected_return: float = 0.0
-    
-    # Portfolio metrics
+    total_positions: int = 0
     total_capital_used: float = 0.0
-    portfolio_expected_return: float = 0.0
+    capital_efficiency: float = 0.0
+    expected_annual_return: float = 0.0
     portfolio_sharpe_ratio: float = 0.0
-    portfolio_volatility: float = 0.0
+    
+    # Strategy specific
+    market_making_orders: int = 0
+    market_making_expected_profit: float = 0.0
+    directional_positions: int = 0
+    directional_expected_return: float = 0.0
+    quick_flips_active: int = 0
+    arbitrage_opportunities: int = 0
     
     # Risk metrics
+    portfolio_volatility: float = 0.0
     max_portfolio_drawdown: float = 0.0
     correlation_score: float = 0.0
-    diversification_ratio: float = 0.0
-    
-    # Performance
-    total_positions: int = 0
-    capital_efficiency: float = 0.0  # % of capital used
-    expected_annual_return: float = 0.0
 
+@dataclass
+class TradingSystemConfig:
+    # Allocation
+    market_making_allocation: float = 0.20
+    directional_trading_allocation: float = 0.50 # Renamed from portfolio_allocation to match trade.py
+    quick_flip_allocation: float = 0.30
+    arbitrage_allocation: float = 0.10
+    
+    # Limits
+    max_position_size_percent: float = 0.05
+    target_annual_return: float = 0.50
+    risk_tolerance: float = 0.7
+    
+    # Risk Management (Kitchen Sink for trade.py compatibility)
+    max_portfolio_volatility: float = 0.20
+    max_correlation_exposure: float = 0.70
+    max_single_position: float = 0.15
+    target_sharpe_ratio: float = 2.0
+    max_drawdown_limit: float = 0.15
+    rebalance_frequency_hours: int = 6
+    profit_taking_threshold: float = 0.25
+    loss_cutting_threshold: float = 0.10
 
 class UnifiedAdvancedTradingSystem:
     """
-    The Beast Mode Trading System 🚀
-    
-    This orchestrates all advanced strategies to maximize returns while
-    optimally using ALL available capital with sophisticated risk management.
-    
-    Strategy allocation:
-    1. Market Making (40%): Profit from spreads without directional risk
-    2. Directional Trading (50%): Take positions based on AI edge
-    3. Arbitrage (10%): Cross-market and temporal arbitrage
-    
-    Features:
-    - No time restrictions (trade any deadline)
-    - Dynamic position sizing (Kelly Criterion Extension)
-    - Risk parity allocation (equal risk contribution)
-    - Real-time rebalancing
-    - Multi-strategy diversification
+    Main controller for the unified trading strategies.
+    Orchestrates ingestion, analysis, and execution.
     """
     
     def __init__(
-        self,
-        db_manager: DatabaseManager,
-        kalshi_client: KalshiClient,
-        xai_client: XAIClient,
-        config: Optional[TradingSystemConfig] = None
+        self, 
+        db_manager: DatabaseManager, 
+        kalshi_client: KalshiClient, 
+        xai_client: XAIClient, # Added XAI Client
+        config: Optional[TradingSystemConfig] = None,
+        odds_client: Optional[OddsClient] = None # Swapped order to match call in run_unified...
     ):
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
-        self.xai_client = xai_client
+        self.xai_client = xai_client # Store it
+        self.market_maker = AdvancedMarketMaker(kalshi_client, db_manager)
+        self.portfolio_optimizer = AdvancedPortfolioOptimizer(db_manager)
+        self.odds_client = odds_client
         self.config = config or TradingSystemConfig()
         self.logger = get_trading_logger("unified_trading_system")
         
@@ -155,41 +129,54 @@ class UnifiedAdvancedTradingSystem:
         from Kalshi and setting the total capital.
         """
         try:
-            # Get total portfolio value (cash + current positions)
-            balance_response = await self.kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100  # Convert cents to dollars
+            # Check for Paper Trading Override
+            if getattr(settings.trading, 'paper_trading_mode', False):
+                self.total_capital = getattr(settings.trading, 'paper_balance', 250.0)
+                self.logger.info(f"🎭 PAPER TRADING MODE: Using simulated balance of ${self.total_capital:.2f}")
+                
+            else:
+                # LIVE MODE: Get total portfolio value (cash + current positions)
+                balance_response = await self.kalshi_client.get_balance()
+                available_cash = balance_response.get('balance', 0) / 100  # Convert cents to dollars
+                
+                # Get current positions to calculate total portfolio value
+                positions_response = await self.kalshi_client.get_positions()
+                positions = positions_response.get('positions', []) if isinstance(positions_response, dict) else []
+                total_position_value = 0
+                
+                if positions:
+                    for position in positions:
+                        if not isinstance(position, dict):
+                            continue  # Skip non-dict positions
+                        quantity = position.get('quantity', 0)
+                        # Get current market price for this position
+                        market_id = position.get('market_id')
+                        if market_id and quantity != 0:
+                            try:
+                                market_data = await self.kalshi_client.get_market(market_id)
+                                market_info = market_data.get('market', {})
+                                if position.get('side') == 'yes':
+                                    current_price = market_info.get('yes_price', 50) / 100
+                                else:
+                                    current_price = market_info.get('no_price', 50) / 100
+                                position_value = abs(quantity) * current_price
+                                total_position_value += position_value
+                            except:
+                                # If we can't get market data, estimate at entry price
+                                total_position_value += abs(quantity) * 0.50  # Conservative 50¢ estimate
+                
+                # Total portfolio value is the basis for all allocations
+                total_portfolio_value = available_cash + total_position_value
+                self.total_capital = total_portfolio_value
+                
+                self.logger.info(f"💰 PORTFOLIO VALUE: Cash=${available_cash:.2f} + Positions=${total_position_value:.2f} = Total=${self.total_capital:.2f}")
             
-            # Get current positions to calculate total portfolio value
-            positions_response = await self.kalshi_client.get_positions()
-            positions = positions_response.get('positions', []) if isinstance(positions_response, dict) else []
-            total_position_value = 0
-            
-            if positions:
-                for position in positions:
-                    if not isinstance(position, dict):
-                        continue  # Skip non-dict positions
-                    quantity = position.get('quantity', 0)
-                    # Get current market price for this position
-                    market_id = position.get('market_id')
-                    if market_id and quantity != 0:
-                        try:
-                            market_data = await self.kalshi_client.get_market(market_id)
-                            market_info = market_data.get('market', {})
-                            if position.get('side') == 'yes':
-                                current_price = market_info.get('yes_price', 50) / 100
-                            else:
-                                current_price = market_info.get('no_price', 50) / 100
-                            position_value = abs(quantity) * current_price
-                            total_position_value += position_value
-                        except:
-                            # If we can't get market data, estimate at entry price
-                            total_position_value += abs(quantity) * 0.50  # Conservative 50¢ estimate
-            
-            # Total portfolio value is the basis for all allocations
-            total_portfolio_value = available_cash + total_position_value
-            self.total_capital = total_portfolio_value
-            
-            self.logger.info(f"💰 PORTFOLIO VALUE: Cash=${available_cash:.2f} + Positions=${total_position_value:.2f} = Total=${self.total_capital:.2f}")
+            if self.total_capital < 10:  # Minimum $10 to trade
+                self.logger.warning(f"⚠️ Total capital too low: ${self.total_capital:.2f} - may limit trading")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to get portfolio value, using default: {e}")
+            self.total_capital = getattr(settings.trading, 'paper_balance', 250.0)  # Fallback to paper balance
             
             if self.total_capital < 10:  # Minimum $10 to trade
                 self.logger.warning(f"⚠️ Total capital too low: ${self.total_capital:.2f} - may limit trading")
@@ -346,7 +333,8 @@ class UnifiedAdvancedTradingSystem:
             # Convert markets to opportunities (with immediate trading capability)
             opportunities = await create_market_opportunities_from_markets(
                 markets, self.xai_client, self.kalshi_client, 
-                self.db_manager, self.directional_capital
+                self.db_manager, self.directional_capital, 
+                self.odds_client, self.arbitrage_engine
             )
             
             if not opportunities:
@@ -588,7 +576,8 @@ class UnifiedAdvancedTradingSystem:
                         stop_loss_price=exit_levels['stop_loss_price'],
                         take_profit_price=exit_levels['take_profit_price'],
                         max_hold_hours=exit_levels['max_hold_hours'],
-                        target_confidence_change=exit_levels['target_confidence_change']
+                        target_confidence_change=exit_levels['target_confidence_change'],
+                        decision_id=getattr(opportunity, 'decision_id', None)
                     )
                     
                     # Add position to database
@@ -804,7 +793,8 @@ async def run_unified_trading_system(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
     xai_client: XAIClient,
-    config: Optional[TradingSystemConfig] = None
+    config: Optional[TradingSystemConfig] = None,
+    odds_client: Optional[OddsClient] = None
 ) -> TradingSystemResults:
     """
     Main entry point for the unified advanced trading system.
@@ -819,7 +809,7 @@ async def run_unified_trading_system(
         
         # Initialize system
         trading_system = UnifiedAdvancedTradingSystem(
-            db_manager, kalshi_client, xai_client, config
+            db_manager, kalshi_client, xai_client, config, odds_client
         )
         
         # 🚨 CRITICAL: Initialize with dynamic balance from Kalshi

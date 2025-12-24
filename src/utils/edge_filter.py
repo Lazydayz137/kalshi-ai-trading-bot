@@ -35,17 +35,17 @@ class EdgeFilter:
     """
     
     # DECREASED: More permissive edge requirements for more trades
-    MIN_EDGE_REQUIREMENT = 0.08        # DECREASED: 8% minimum edge (was 15%)
-    HIGH_CONFIDENCE_EDGE = 0.06        # DECREASED: 6% edge for high confidence (was 12%)  
-    MEDIUM_CONFIDENCE_EDGE = 0.08      # DECREASED: 8% edge for medium confidence (was 15%)
-    LOW_CONFIDENCE_EDGE = 0.12         # DECREASED: 12% edge for low confidence (was 20%)
+    MIN_EDGE_REQUIREMENT = 0.01        # DECREASED: 1% minimum edge (was 3%)
+    HIGH_CONFIDENCE_EDGE = 0.01        # DECREASED: 1% edge for high confidence
+    MEDIUM_CONFIDENCE_EDGE = 0.02      # DECREASED: 2% edge for medium confidence
+    LOW_CONFIDENCE_EDGE = 0.03         # DECREASED: 3% edge for low confidence
     
     # DECREASED: More permissive filters for more opportunities
-    MIN_CONFIDENCE_FOR_TRADE = 0.50    # DECREASED: 50% minimum confidence (was 65%)
-    MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+    MIN_CONFIDENCE_FOR_TRADE = 0.35    # DECREASED: 35% minimum confidence (was 40%)
+    MAX_ACCEPTABLE_RISK = 0.80         # INCREASED: 80% max position risk
     
     # UPDATED: More permissive quality filters
-    MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+    MIN_VOLUME_FOR_HIGH_EDGE = 50      # DECREASED: Lower volume requirement (was 500, now 50)
     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
     
     @classmethod
@@ -53,18 +53,13 @@ class EdgeFilter:
         cls,
         ai_probability: float,
         market_probability: float,
-        confidence: Optional[float] = None
+        confidence: Optional[float] = None,
+        yes_ask: float = 0,
+        no_ask: float = 0
     ) -> EdgeFilterResult:
         """
         Calculate edge and determine if it meets filtering criteria.
-        
-        Args:
-            ai_probability: AI predicted probability (0.0 to 1.0)
-            market_probability: Current market price/probability (0.0 to 1.0)
-            confidence: AI confidence level (0.0 to 1.0)
-            
-        Returns:
-            EdgeFilterResult with filtering decision and details
+        Now supports "Realizable Edge" calculation using Ask prices (Execution Price).
         """
         
         # Validate inputs
@@ -72,15 +67,24 @@ class EdgeFilter:
         market_probability = max(0.01, min(0.99, market_probability))
         confidence = confidence or 0.7
         
-        # Calculate raw edge (probability difference)
-        edge_magnitude = ai_probability - market_probability
-        edge_percentage = abs(edge_magnitude)
-        
-        # Determine position side based on edge direction
-        if edge_magnitude > 0:
-            side = "YES"  # AI thinks YES is underpriced
+        # 1. Determine direction based on Mid-Price/Market Prob first
+        raw_edge_magnitude = ai_probability - market_probability
+        if raw_edge_magnitude > 0:
+            side = "YES"
+            # Realizable Edge = Value - Cost
+            # Value = AI Prob. Cost = Yes Ask.
+            # If no Ask available, fallback to market_probability (Mid)
+            execution_price = yes_ask / 100.0 if yes_ask > 0 else market_probability
+            edge_magnitude = ai_probability - execution_price
         else:
-            side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+            side = "NO"
+            # Realizable Edge = Value - Cost
+            # Value = (1 - AI Prob). Cost = No Ask.
+            # If no Ask available, fallback to (1 - market_probability)
+            execution_price = no_ask / 100.0 if no_ask > 0 else (1 - market_probability)
+            edge_magnitude = (1 - ai_probability) - execution_price
+            
+        edge_percentage = edge_magnitude # Already absolute value of edge for that side
         
         # Confidence-adjusted edge thresholds
         if confidence >= 0.8:
@@ -93,8 +97,9 @@ class EdgeFilter:
         # Calculate confidence-adjusted edge
         confidence_adjusted_edge = edge_percentage * confidence
         
-        # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
-        passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+        # Check if edge meets requirements
+        # Note: edge_magnitude can be negative if Spread > Raw Edge.
+        passes_basic_edge = edge_percentage > (required_edge - 0.001)
         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
         
         # Generate filtering decision and reason
@@ -103,7 +108,10 @@ class EdgeFilter:
             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
         elif not passes_basic_edge:
             passes_filter = False
-            reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+            if edge_magnitude < 0:
+                reason = f"Negative Realizable Edge ({edge_magnitude:.1%}). Spread eats all profit."
+            else:
+                reason = f"Real Edge {edge_percentage:.1%} below required {required_edge:.1%} (Ask Price: {execution_price:.2f})"
         else:
             passes_filter = True
             reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"

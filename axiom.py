@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Beast Mode Trading Bot 🚀
+Axiom Trading Bot 🚀
 
 Main entry point for the Unified Advanced Trading System that orchestrates:
 - Market Making Strategy (40% allocation)
@@ -15,9 +15,9 @@ Features:
 - Market making for spread profits
 
 Usage:
-    python beast_mode_bot.py              # Paper trading mode
-    python beast_mode_bot.py --live       # Live trading mode
-    python beast_mode_bot.py --dashboard  # Live dashboard mode
+    python axiom.py              # Paper trading mode
+    python axiom.py --live       # Live trading mode
+    python axiom.py --dashboard  # Live dashboard mode
 """
 
 import asyncio
@@ -37,14 +37,14 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 
-# Import Beast Mode components
+# Import Axiom components
 from src.strategies.unified_trading_system import run_unified_trading_system, TradingSystemConfig
-from beast_mode_dashboard import BeastModeDashboard
+# Dashboard import removed/deprecated in favor of Streamlit
 
 
-class BeastModeBot:
+class AxiomBot:
     """
-    Beast Mode Trading Bot - Advanced Multi-Strategy Trading System 🚀
+    Axiom Trading Bot - Advanced Multi-Strategy Trading System 🚀
     
     This bot orchestrates all advanced strategies:
     1. Market Making (spread profits)
@@ -61,7 +61,7 @@ class BeastModeBot:
     def __init__(self, live_mode: bool = False, dashboard_mode: bool = False):
         self.live_mode = live_mode
         self.dashboard_mode = dashboard_mode
-        self.logger = get_trading_logger("beast_mode_bot")
+        self.logger = get_trading_logger("axiom_bot")
         self.shutdown_event = asyncio.Event()
         
         # Set live trading in settings
@@ -69,25 +69,25 @@ class BeastModeBot:
         settings.trading.paper_trading_mode = not live_mode
         
         self.logger.info(
-            f"🚀 Beast Mode Bot initialized - "
+            f"🚀 Axiom Bot initialized - "
             f"Mode: {'LIVE TRADING' if live_mode else 'PAPER TRADING'}"
         )
 
     async def run_dashboard_mode(self):
         """Run in live dashboard mode with real-time updates."""
         try:
-            self.logger.info("🚀 Starting Beast Mode Dashboard Mode")
-            dashboard = BeastModeDashboard()
-            await dashboard.show_live_dashboard()
+            self.logger.info("🚀 Starting Axiom Dashboard Mode")
+            # Legacy dashboard support removed
+            self.logger.warning("Please use 'streamlit run axiom_dashboard.py' for the new console.")
         except KeyboardInterrupt:
             self.logger.info("👋 Dashboard mode stopped")
         except Exception as e:
             self.logger.error(f"Error in dashboard mode: {e}")
 
     async def run_trading_mode(self):
-        """Run the Beast Mode trading system with all strategies."""
+        """Run the Axiom trading system with all strategies."""
         try:
-            self.logger.info("🚀 BEAST MODE TRADING BOT STARTED")
+            self.logger.info("🚀 AXIOM TRADING BOT STARTED")
             self.logger.info(f"📊 Trading Mode: {'LIVE' if self.live_mode else 'PAPER'}")
             self.logger.info(f"💰 Daily AI Budget: ${settings.trading.daily_ai_budget}")
             self.logger.info(f"⚡ Features: Market Making + Portfolio Optimization + Dynamic Exits")
@@ -100,7 +100,16 @@ class BeastModeBot:
             
             # Initialize other components
             kalshi_client = KalshiClient()
-            xai_client = XAIClient(db_manager=db_manager)  # Pass db_manager for LLM logging
+            
+            # Choose AI client based on available keys
+            if settings.api.xai_api_key:
+                xai_client = XAIClient(db_manager=db_manager)
+            elif settings.api.openai_api_key:
+                self.logger.info("Using OpenAI/OpenRouter client as XAI key is missing")
+                from src.clients.openai_client import OpenAIClient
+                xai_client = OpenAIClient(db_manager=db_manager)
+            else:
+                raise ValueError("No valid AI API key found (Checked XAI_API_KEY and OPENAI_API_KEY)")
             
             # Small delay to ensure everything is ready
             await asyncio.sleep(1)
@@ -138,10 +147,10 @@ class BeastModeBot:
             await xai_client.close()
             await kalshi_client.close()
             
-            self.logger.info("🏁 Beast Mode Bot shut down gracefully")
+            self.logger.info("🏁 Axiom Bot shut down gracefully")
             
         except Exception as e:
-            self.logger.error(f"Error in Beast Mode Bot: {e}")
+            self.logger.error(f"Error in Axiom Bot: {e}")
             raise
 
     async def _ensure_database_ready(self, db_manager: DatabaseManager):
@@ -166,17 +175,21 @@ class BeastModeBot:
         """Background task for market data ingestion."""
         while not self.shutdown_event.is_set():
             try:
-                # Create a queue for market ingestion (though we're not using it in Beast Mode)
+                # Create a queue for market ingestion
                 market_queue = asyncio.Queue()
                 # ✅ FIXED: Pass the shared database manager
                 await run_ingestion(db_manager, market_queue)
-                await asyncio.sleep(300)  # Run every 5 minutes (much slower to prevent 429s)
+                
+                # Ingestion needs to be brisk but not as fast as trading
+                sleep_time = max(30, settings.trading.market_scan_interval * 2)
+                self.logger.info(f"💤 Ingestion sleeping for {sleep_time}s...")
+                await asyncio.sleep(sleep_time) 
             except Exception as e:
                 self.logger.error(f"Error in market ingestion: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
 
     async def _run_trading_cycles(self, db_manager: DatabaseManager, kalshi_client: KalshiClient, xai_client: XAIClient):
-        """Main Beast Mode trading cycles."""
+        """Main Axiom trading cycles."""
         cycle_count = 0
         
         while not self.shutdown_event.is_set():
@@ -188,9 +201,9 @@ class BeastModeBot:
                     continue
                 
                 cycle_count += 1
-                self.logger.info(f"🔄 Starting Beast Mode Trading Cycle #{cycle_count}")
+                self.logger.info(f"🔄 Starting Axiom Trading Cycle #{cycle_count}")
                 
-                # Run the Beast Mode unified trading system
+                # Run the unified trading system
                 results = await run_trading_job()
                 
                 if results and results.total_positions > 0:
@@ -203,12 +216,14 @@ class BeastModeBot:
                 else:
                     self.logger.info(f"📊 Cycle #{cycle_count} Complete - No new positions created")
                 
-                # Wait for next cycle (60 seconds)
-                await asyncio.sleep(60)
+                # Wait for next cycle (High Frequency Sniping)
+                sleep_time = settings.trading.market_scan_interval
+                self.logger.info(f"⚡ Fast Cycle Sleep: {sleep_time}s")
+                await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 self.logger.error(f"Error in trading cycle #{cycle_count}: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(10)
 
     async def _check_daily_ai_limits(self, xai_client: XAIClient) -> bool:
         """
@@ -286,7 +301,7 @@ class BeastModeBot:
                 await asyncio.sleep(300)
 
     async def run(self):
-        """Main entry point for Beast Mode Bot."""
+        """Main entry point for Axiom Bot."""
         if self.dashboard_mode:
             await self.run_dashboard_mode()
         else:
@@ -296,16 +311,16 @@ class BeastModeBot:
 async def main():
     """Main entry point with command line argument parsing."""
     parser = argparse.ArgumentParser(
-        description="Beast Mode Trading Bot 🚀 - Advanced Multi-Strategy Trading System",
+        description="Axiom Trading Bot 🚀 - Advanced Multi-Strategy Trading System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python beast_mode_bot.py              # Paper trading mode
-  python beast_mode_bot.py --live       # Live trading mode  
-  python beast_mode_bot.py --dashboard  # Live dashboard mode
-  python beast_mode_bot.py --live --log-level DEBUG  # Live mode with debug logs
+  python axiom.py              # Paper trading mode
+  python axiom.py --live       # Live trading mode  
+  python axiom.py --dashboard  # Live dashboard mode
+  python axiom.py --live --log-level DEBUG  # Live mode with debug logs
 
-Beast Mode Features:
+Axiom Features:
   • Market Making (40% allocation) - Profit from spreads
   • Directional Trading (50% allocation) - AI predictions with portfolio optimization
   • Arbitrage Detection (10% allocation) - Cross-market opportunities
@@ -345,8 +360,8 @@ Beast Mode Features:
         print("💰 This will use real money and place actual trades!")
         print("🚀 LIVE TRADING MODE CONFIRMED")
     
-    # Create and run Beast Mode Bot
-    bot = BeastModeBot(live_mode=args.live, dashboard_mode=args.dashboard)
+    # Create and run Axiom Bot
+    bot = AxiomBot(live_mode=args.live, dashboard_mode=args.dashboard)
     await bot.run()
 
 
@@ -354,7 +369,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Beast Mode Bot stopped by user")
+        print("\n👋 Axiom Bot stopped by user")
     except Exception as e:
-        print(f"❌ Beast Mode Bot error: {e}")
-        raise 
+        print(f"❌ Axiom Bot error: {e}")
+        raise

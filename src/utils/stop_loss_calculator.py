@@ -88,14 +88,12 @@ class StopLossCalculator:
             take_profit_pct = cls.MIN_TAKE_PROFIT_PCT  # 15% for low confidence
             
         # Calculate actual price levels based on side
-        if side.upper() == "YES":
-            # For YES positions, stop-loss is below entry, take-profit is above
-            stop_loss_price = entry_price * (1 - adjusted_stop_loss_pct)
-            take_profit_price = entry_price * (1 + take_profit_pct)
-        else:
-            # For NO positions, stop-loss is above entry, take-profit is below  
-            stop_loss_price = entry_price * (1 + adjusted_stop_loss_pct)
-            take_profit_price = entry_price * (1 - take_profit_pct)
+        # NOTE: Kalshi positions are always LONG positions on the contract (YES or NO).
+        # We always want the price of the contract we hold to INCREASE.
+        # Therefore, Stop Loss is always BELOW entry, and Take Profit is always ABOVE entry.
+        
+        stop_loss_price = entry_price * (1 - adjusted_stop_loss_pct)
+        take_profit_price = entry_price * (1 + take_profit_pct)
             
         # Ensure prices are within valid bounds (1¢ to 99¢)
         stop_loss_price = max(0.01, min(0.99, stop_loss_price))
@@ -133,10 +131,8 @@ class StopLossCalculator:
         Returns:
             Stop-loss price
         """
-        if side.upper() == "YES":
-            stop_loss_price = entry_price * (1 - stop_loss_pct)
-        else:
-            stop_loss_price = entry_price * (1 + stop_loss_pct)
+        # Since all positions are LONG, stop loss is always price drop
+        stop_loss_price = entry_price * (1 - stop_loss_pct)
             
         return max(0.01, min(0.99, round(stop_loss_price, 2)))
     
@@ -160,12 +156,8 @@ class StopLossCalculator:
         Returns:
             True if stop-loss should be triggered
         """
-        if position_side.upper() == "YES":
-            # For YES positions, trigger if price drops below stop-loss
-            return current_price <= stop_loss_price
-        else:
-            # For NO positions, trigger if price rises above stop-loss
-            return current_price >= stop_loss_price
+        # Trigger if price drops below stop-loss (applies to both YES and NO)
+        return current_price <= stop_loss_price
     
     @classmethod
     def calculate_pnl_at_stop_loss(
@@ -181,10 +173,8 @@ class StopLossCalculator:
         Returns:
             Expected P&L (negative for loss)
         """
-        if side.upper() == "YES":
-            pnl_per_share = stop_loss_price - entry_price
-        else:
-            pnl_per_share = entry_price - stop_loss_price
+        # All positions are long, so PnL is (Exit - Entry)
+        pnl_per_share = stop_loss_price - entry_price
             
         return pnl_per_share * quantity
 

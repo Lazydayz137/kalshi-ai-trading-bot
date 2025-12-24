@@ -24,13 +24,7 @@ from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
 from src.utils.prompts import SIMPLIFIED_PROMPT_TPL
 
 
-@dataclass
-class TradingDecision:
-    """Represents an AI trading decision."""
-    action: str  # "buy", "sell", "hold"
-    side: str    # "yes", "no"
-    confidence: float  # 0.0 to 1.0
-    limit_price: Optional[int] = None # The limit price for the order in cents.
+from src.utils.structs import TradingDecision, AIDecisionResult
 
 
 @dataclass
@@ -363,6 +357,9 @@ class XAIClient(TradingLoggerMixin):
         
         # Generic optimization
         query = query[:150]  # Reasonable length limit
+        # Append keywords to guide search towards useful data
+        if "market" not in query.lower() and "odds" not in query.lower():
+            return f"{query.strip()} latest news odds stats"
         return query.strip()
     
     def _create_search_prompt(self, query: str, max_length: int) -> str:
@@ -372,11 +369,11 @@ class XAIClient(TradingLoggerMixin):
         return f"""Find current, relevant information about: {query}
 
 Focus on:
-- Recent news, data, or announcements
-- Factual information from reliable sources
-- Current conditions or forecasts if applicable
+- **Betting Odds & Predictions**: Look for Polymarket, Betfair, PredictIt, or FiveThirtyEight probabilities.
+- **Statistical Data**: Polls, rankings, historical performance, weather forecasts.
+- **Recent News**: Breaking announcements or confirmed reports.
 
-Provide a brief, factual summary under {max_length//2} words. If no current information is available, clearly state that."""
+Provide a factual summary with specific numbers/odds if available. Limit to {max_length//2} words."""
     
     def _process_search_response(self, response: Any, original_query: str, processing_time: float, max_length: int) -> str:
         """
@@ -436,30 +433,31 @@ Provide a brief, factual summary under {max_length//2} words. If no current info
         market_data: Dict,
         portfolio_data: Dict,
         news_summary: str = ""
-    ) -> Optional[TradingDecision]:
+    ) -> AIDecisionResult:
         """
         Get a trading decision from the AI with improved token management.
+        Returns detailed result including prompt/response for training.
         """
         try:
             # First try with full prompt
-            decision = await self._get_trading_decision_with_prompt(
+            result = await self._get_trading_decision_with_prompt(
                 market_data, portfolio_data, news_summary, use_simplified=False
             )
             
-            if decision:
-                return decision
+            if result.decision:
+                return result
             
             # If that fails, try with simplified prompt
             self.logger.info("Trying simplified prompt for trading decision")
-            decision = await self._get_trading_decision_with_prompt(
+            result = await self._get_trading_decision_with_prompt(
                 market_data, portfolio_data, news_summary, use_simplified=True
             )
             
-            return decision
+            return result
             
         except Exception as e:
             self.logger.error(f"Error getting trading decision: {str(e)}")
-            return None
+            return AIDecisionResult(None, "", "", self.primary_model)
 
     async def _get_trading_decision_with_prompt(
         self,
@@ -467,7 +465,7 @@ Provide a brief, factual summary under {max_length//2} words. If no current info
         portfolio_data: Dict,
         news_summary: str = "",
         use_simplified: bool = False
-    ) -> Optional[TradingDecision]:
+    ) -> AIDecisionResult:
         """
         Get trading decision with either full or simplified prompt.
         """
@@ -489,14 +487,16 @@ Provide a brief, factual summary under {max_length//2} words. If no current info
             )
             
             if not response_text:
-                return None
+                return AIDecisionResult(None, prompt, "", self.primary_model)
             
             # Parse the JSON response
-            return self._parse_trading_decision(response_text)
+            decision = self._parse_trading_decision(response_text)
+            
+            return AIDecisionResult(decision, prompt, response_text, self.primary_model)
             
         except Exception as e:
             self.logger.error(f"Error in _get_trading_decision_with_prompt (simplified={use_simplified}): {str(e)}")
-            return None
+            return AIDecisionResult(None, "", str(e), self.primary_model)
 
     def _create_simplified_trading_prompt(
         self,

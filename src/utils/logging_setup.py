@@ -59,13 +59,20 @@ def setup_logging(log_level: str = "INFO") -> None:
         cache_logger_on_first_use=True,
     )
     
+    # Force UTF-8 for stdout/stderr to prevent emoji crashes on Windows
+    if sys.platform == "win32":
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8')
+
     # Configure standard library logging
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=getattr(logging, log_level.upper()),
         handlers=[
-            logging.FileHandler(log_file),
-            logging.FileHandler(latest_log, mode='w'),
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.FileHandler(latest_log, mode='w', encoding='utf-8'),
             logging.StreamHandler(sys.stdout),
         ],
     )

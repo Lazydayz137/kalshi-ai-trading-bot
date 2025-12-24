@@ -129,14 +129,22 @@ async def run_ingestion(
         else:
             logger.info("Fetching all active markets from Kalshi API with pagination.")
             cursor = None
+            page_count = 0
+            total_fetched = 0
+            MAX_PAGES = 30  # Fetch up to ~3000 markets to ensure we find Sports
+            
             while True:
-                response = await kalshi_client.get_markets(limit=100, cursor=cursor)
+                page_count += 1
+                # FIXED: Request ONLY active markets from API to avoid scanning thousands of closed/initialized ones
+                response = await kalshi_client.get_markets(limit=100, cursor=cursor, status="open")
                 markets_page = response.get("markets", [])
 
+                # We still keep the list comp just in case, but API should filter for us now
                 active_markets = [m for m in markets_page if m["status"] == "active"]
                 if active_markets:
+                    total_fetched += len(active_markets)
                     logger.info(
-                        f"Fetched {len(markets_page)} markets, {len(active_markets)} are active."
+                        f"Page {page_count}: Fetched {len(markets_page)} markets, {len(active_markets)} active. Total active: {total_fetched}"
                     )
                     await process_and_queue_markets(
                         active_markets,
@@ -145,9 +153,13 @@ async def run_ingestion(
                         existing_position_market_ids,
                         logger,
                     )
+                else:
+                    logger.info(f"Page {page_count}: No active markets found.")
 
                 cursor = response.get("cursor")
-                if not cursor:
+                if not cursor or page_count >= MAX_PAGES:
+                    if page_count >= MAX_PAGES:
+                        logger.info(f"Reached MAX_PAGES ({MAX_PAGES}), stopping ingestion.")
                     break
 
     except Exception as e:

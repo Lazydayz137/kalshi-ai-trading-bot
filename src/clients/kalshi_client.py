@@ -372,10 +372,11 @@ class KalshiClient(TradingLoggerMixin):
             "type": type_
         }
         
-        if yes_price is not None:
+        if side.lower() == 'yes' and yes_price is not None:
             order_data["yes_price"] = yes_price
-        if no_price is not None:
+        elif side.lower() == 'no' and no_price is not None:
             order_data["no_price"] = no_price
+            
         if expiration_ts:
             order_data["expiration_ts"] = expiration_ts
         
